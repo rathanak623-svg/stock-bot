@@ -128,4 +128,79 @@ app.get('/', (req, res) => {
   res.send('Bot running');
 });
 
-app.listen(process.env.PORT || 10000);
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, async () => {
+  console.log('Server running on port ' + PORT);
+
+  try {
+    await setupSheet();
+  } catch (err) {
+    console.error('Setup error:', err.message);
+  }
+});
+async function setupSheet() {
+  const spreadsheetId = SPREADSHEET_ID;
+
+  // 1. get sheet metadata
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId
+  });
+
+  const sheetsList = meta.data.sheets.map(s => s.properties.title);
+
+  // 2. check if "Stock" exists
+  if (!sheetsList.includes('Stock')) {
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId,
+      requestBody: {
+        requests: [
+          {
+            addSheet: {
+              properties: {
+                title: 'Stock'
+              }
+            }
+          }
+        ]
+      }
+    });
+
+    console.log('✅ Created Stock sheet');
+  }
+
+  // 3. check header
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId,
+    range: "'Stock'!A1:G1"
+  });
+
+  const header = res.data.values;
+
+  if (!header || header.length === 0) {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId,
+      range: "'Stock'!A1:G1",
+      valueInputOption: 'RAW',
+      requestBody: {
+        values: [[
+          'Item',
+          'In',
+          'Out',
+          'Balance',
+          'MinAlert',
+          'Unit',
+          'UpdatedAt'
+        ]]
+      }
+    });
+
+    console.log('✅ Header created');
+  } else {
+    console.log('ℹ️ Header already exists');
+  }
+}
+if (cmd === '/setup') {
+  await setupSheet();
+  return send(chatId, '✅ Sheet ready');
+}
