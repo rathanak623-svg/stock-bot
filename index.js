@@ -10,7 +10,19 @@ const SPREADSHEET_ID = '1wTsR0u2pJIoYSz9PpDwBGMxl177TLm4q7Cgu2uknXSg';
 
 const TELEGRAM_API = `https://api.telegram.org/bot${'8309116881:AAGgmKDI_OTf5Cdzm1Gf_mhrhkqqEcsG7qA'}`;
 
+if (!process.env.GOOGLE_CLIENT_EMAIL) {
+  throw new Error('Missing GOOGLE_CLIENT_EMAIL');
+}
+
+if (!process.env.GOOGLE_PRIVATE_KEY) {
+  throw new Error('Missing GOOGLE_PRIVATE_KEY');
+}
+
 const auth = new google.auth.GoogleAuth({
+  credentials: {
+    client_email: process.env.GOOGLE_CLIENT_EMAIL,
+    private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n')
+  },
   scopes: ['https://www.googleapis.com/auth/spreadsheets']
 });
 
