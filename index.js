@@ -5,11 +5,13 @@ const { google } = require('googleapis');
 const app = express();
 app.use(express.json());
 
-const TELEGRAM_TOKEN = '8309116881:AAGgmKDI_OTf5Cdzm1Gf_mhrhkqqEcsG7qA';
-const SPREADSHEET_ID = '1wTsR0u2pJIoYSz9PpDwBGMxl177TLm4q7Cgu2uknXSg';
+/**************** CONFIG ****************/
+const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN || 'PUT_YOUR_TELEGRAM_TOKEN';
+const SPREADSHEET_ID = process.env.SPREADSHEET_ID || 'PUT_YOUR_SPREADSHEET_ID';
 
-const TELEGRAM_API = `https://api.telegram.org/bot${'8309116881:AAGgmKDI_OTf5Cdzm1Gf_mhrhkqqEcsG7qA'}`;
+const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
+/**************** ENV CHECK ****************/
 if (!process.env.GOOGLE_CLIENT_EMAIL) {
   throw new Error('Missing GOOGLE_CLIENT_EMAIL');
 }
@@ -18,6 +20,7 @@ if (!process.env.GOOGLE_PRIVATE_KEY) {
   throw new Error('Missing GOOGLE_PRIVATE_KEY');
 }
 
+/**************** GOOGLE AUTH ****************/
 const auth = new google.auth.GoogleAuth({
   credentials: {
     client_email: process.env.GOOGLE_CLIENT_EMAIL,
@@ -28,131 +31,55 @@ const auth = new google.auth.GoogleAuth({
 
 const sheets = google.sheets({ version: 'v4', auth });
 
-async function send(chatId, text) {
+/**************** HELPERS ****************/
+function norm(text) {
+  return String(text || '').trim().toLowerCase();
+}
+
+function clean(text) {
+  return String(text || '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[\u200B\u200C\u200D\u2060\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function parsePipe(text) {
+  return String(text || '')
+    .split('|')
+    .map(part => clean(part));
+}
+
+async function sendMessage(chatId, text) {
   await axios.post(`${TELEGRAM_API}/sendMessage`, {
     chat_id: chatId,
     text: text
   });
 }
 
-function norm(t) {
-  return (t || '').toLowerCase().trim();
+function findRowIndex(data, itemName) {
+  const target = norm(itemName);
+
+  for (let i = 0; i < data.length; i++) {
+    if (norm(data[i][0]) === target) {
+      return i;
+    }
+  }
+
+  return -1;
 }
 
-async function getData() {
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: '1wTsR0u2pJIoYSz9PpDwBGMxl177TLm4q7Cgu2uknXSg',
-    range: 'Stock!A2:G'
-  });
-  return res.data.values || [];
-}
-
-function find(data, name) {
-  return data.findIndex(r => norm(r[0]) === norm(name));
-}
-
-async function update(row, values) {
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: '1wTsR0u2pJIoYSz9PpDwBGMxl177TLm4q7Cgu2uknXSg',
-    range: `Stock!A${row + 2}:G${row + 2}`,
-    valueInputOption: 'RAW',
-    requestBody: { values: [values] }
-  });
-}
-
-async function handle(chatId, text) {
-  const p = text.split('|').map(x => x.trim());
-  const cmd = p[0].toLowerCase();
-  const data = await getData();
-
-  if (cmd === '/help') {
-    return send(chatId, '/additem | name | min | unit\n/in | name | qty\n/out | name | qty\n/stock | name');
-  }
-
-  if (cmd === '/additem') {
-    await sheets.spreadsheets.values.append({
-      spreadsheetId: '1wTsR0u2pJIoYSz9PpDwBGMxl177TLm4q7Cgu2uknXSg',
-      range: 'Stock!A:G',
-      valueInputOption: 'RAW',
-      requestBody: { values: [[p[1],0,0,0,p[2],p[3],new Date()]] }
-    });
-    return send(chatId, '✅ Added');
-  }
-
-  if (cmd === '/in') {
-    const i = find(data, p[1]);
-    if (i === -1) return send(chatId, '❌ Not found');
-
-    const r = data[i];
-    const ni = (+r[1]||0) + (+p[2]);
-    const out = +r[2]||0;
-
-    await update(i, [r[0], ni, out, ni-out, r[4], r[5], new Date()]);
-    return send(chatId, '📥 Updated');
-  }
-
-  if (cmd === '/out') {
-    const i = find(data, p[1]);
-    if (i === -1) return send(chatId, '❌ Not found');
-
-    const r = data[i];
-    const ni = +r[1]||0;
-    const no = (+r[2]||0) + (+p[2]);
-
-    if (ni-no < 0) return send(chatId, '❌ Not enough');
-
-    await update(i, [r[0], ni, no, ni-no, r[4], r[5], new Date()]);
-    return send(chatId, '📤 Updated');
-  }
-
-  if (cmd === '/stock') {
-    const i = find(data, p[1]);
-    if (i === -1) return send(chatId, '❌ Not found');
-
-    const r = data[i];
-    return send(chatId, `💊 ${r[0]}\n📦 ${r[3]} ${r[5]}`);
-  }
-
-  return send(chatId, '❌ Unknown');
-}
-
-app.post('/webhook', async (req, res) => {
-  const msg = req.body.message;
-  if (msg && msg.text) {
-    await handle(msg.chat.id, msg.text);
-  }
-  res.sendStatus(200);
-});
-
-app.get('/', (req, res) => {
-  res.send('Bot running');
-});
-
-const PORT = process.env.PORT || 10000;
-
-app.listen(PORT, async () => {
-  console.log('Server running on port ' + PORT);
-
-  try {
-    await setupSheet();
-  } catch (err) {
-    console.error('Setup error:', err.message);
-  }
-});
+/**************** SHEET SETUP ****************/
 async function setupSheet() {
-  const spreadsheetId = '1wTsR0u2pJIoYSz9PpDwBGMxl177TLm4q7Cgu2uknXSg';
-
-  // 1. get sheet metadata
   const meta = await sheets.spreadsheets.get({
-    spreadsheetId
+    spreadsheetId: SPREADSHEET_ID
   });
 
-  const sheetsList = meta.data.sheets.map(s => s.properties.title);
+  const sheetTitles = (meta.data.sheets || []).map(s => s.properties.title);
 
-  // 2. check if "Stock" exists
-  if (!sheetsList.includes('Stock')) {
+  if (!sheetTitles.includes('Stock')) {
     await sheets.spreadsheets.batchUpdate({
-      spreadsheetId,
+      spreadsheetId: SPREADSHEET_ID,
       requestBody: {
         requests: [
           {
@@ -169,17 +96,16 @@ async function setupSheet() {
     console.log('✅ Created Stock sheet');
   }
 
-  // 3. check header
-  const res = await sheets.spreadsheets.values.get({
-    spreadsheetId,
+  const headerRes = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
     range: "'Stock'!A1:G1"
   });
 
-  const header = res.data.values;
+  const header = headerRes.data.values || [];
 
-  if (!header || header.length === 0) {
+  if (header.length === 0) {
     await sheets.spreadsheets.values.update({
-      spreadsheetId,
+      spreadsheetId: SPREADSHEET_ID,
       range: "'Stock'!A1:G1",
       valueInputOption: 'RAW',
       requestBody: {
@@ -200,7 +126,292 @@ async function setupSheet() {
     console.log('ℹ️ Header already exists');
   }
 }
-if (cmd === '/setup') {
-  await setupSheet();
-  return send(chatId, '✅ Sheet ready');
+
+/**************** STOCK DATA ****************/
+async function getData() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: "'Stock'!A2:G"
+  });
+
+  return res.data.values || [];
 }
+
+async function appendRow(values) {
+  await sheets.spreadsheets.values.append({
+    spreadsheetId: SPREADSHEET_ID,
+    range: "'Stock'!A:G",
+    valueInputOption: 'RAW',
+    requestBody: {
+      values: [values]
+    }
+  });
+}
+
+async function updateRow(rowIndex, values) {
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `'Stock'!A${rowIndex + 2}:G${rowIndex + 2}`,
+    valueInputOption: 'RAW',
+    requestBody: {
+      values: [values]
+    }
+  });
+}
+
+/**************** COMMAND HANDLER ****************/
+async function handleCommand(chatId, text) {
+  const parts = parsePipe(text);
+  const command = norm(parts[0]);
+
+  if (!command) {
+    return sendMessage(chatId, '⚠️ Invalid command');
+  }
+
+  if (command === '/start' || command === '/help') {
+    return sendMessage(
+      chatId,
+      '🤖 Stock Bot\n\n' +
+      'Commands:\n' +
+      '/additem | Item Name | MinAlert | Unit\n' +
+      '/in | Item Name | Qty\n' +
+      '/out | Item Name | Qty\n' +
+      '/stock | Item Name\n' +
+      '/allstock'
+    );
+  }
+
+  const data = await getData();
+
+  if (command === '/additem') {
+    if (parts.length < 4) {
+      return sendMessage(chatId, '⚠️ Usage:\n/additem | Item Name | MinAlert | Unit');
+    }
+
+    const itemName = clean(parts[1]);
+    const minAlert = Number(parts[2]);
+    const unit = clean(parts[3]);
+
+    if (!itemName) {
+      return sendMessage(chatId, '⚠️ Item name required');
+    }
+
+    if (Number.isNaN(minAlert) || minAlert < 0) {
+      return sendMessage(chatId, '⚠️ MinAlert must be a valid number');
+    }
+
+    if (!unit) {
+      return sendMessage(chatId, '⚠️ Unit required');
+    }
+
+    const existing = findRowIndex(data, itemName);
+    if (existing !== -1) {
+      return sendMessage(chatId, `⚠️ Item already exists: ${itemName}`);
+    }
+
+    await appendRow([
+      itemName,
+      0,
+      0,
+      0,
+      minAlert,
+      unit,
+      new Date().toISOString()
+    ]);
+
+    return sendMessage(chatId, `✅ Added: ${itemName}`);
+  }
+
+  if (command === '/in') {
+    if (parts.length < 3) {
+      return sendMessage(chatId, '⚠️ Usage:\n/in | Item Name | Qty');
+    }
+
+    const itemName = clean(parts[1]);
+    const qty = Number(parts[2]);
+
+    if (!itemName) {
+      return sendMessage(chatId, '⚠️ Item name required');
+    }
+
+    if (Number.isNaN(qty) || qty <= 0) {
+      return sendMessage(chatId, '⚠️ Qty must be greater than 0');
+    }
+
+    const row = findRowIndex(data, itemName);
+    if (row === -1) {
+      return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+    }
+
+    const r = data[row];
+    const currentIn = Number(r[1] || 0);
+    const currentOut = Number(r[2] || 0);
+    const minAlert = Number(r[4] || 0);
+    const unit = r[5] || '';
+
+    const newIn = currentIn + qty;
+    const balance = newIn - currentOut;
+
+    await updateRow(row, [
+      r[0],
+      newIn,
+      currentOut,
+      balance,
+      minAlert,
+      unit,
+      new Date().toISOString()
+    ]);
+
+    return sendMessage(
+      chatId,
+      `📥 Stock updated\n\n` +
+      `💊 Item: ${r[0]}\n` +
+      `➕ Qty: ${qty}\n` +
+      `📦 Balance: ${balance} ${unit}`
+    );
+  }
+
+  if (command === '/out') {
+    if (parts.length < 3) {
+      return sendMessage(chatId, '⚠️ Usage:\n/out | Item Name | Qty');
+    }
+
+    const itemName = clean(parts[1]);
+    const qty = Number(parts[2]);
+
+    if (!itemName) {
+      return sendMessage(chatId, '⚠️ Item name required');
+    }
+
+    if (Number.isNaN(qty) || qty <= 0) {
+      return sendMessage(chatId, '⚠️ Qty must be greater than 0');
+    }
+
+    const row = findRowIndex(data, itemName);
+    if (row === -1) {
+      return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+    }
+
+    const r = data[row];
+    const currentIn = Number(r[1] || 0);
+    const currentOut = Number(r[2] || 0);
+    const minAlert = Number(r[4] || 0);
+    const unit = r[5] || '';
+    const balance = currentIn - currentOut;
+
+    if (qty > balance) {
+      return sendMessage(chatId, `❌ Not enough stock\n📦 Balance: ${balance} ${unit}`);
+    }
+
+    const newOut = currentOut + qty;
+    const newBalance = currentIn - newOut;
+
+    await updateRow(row, [
+      r[0],
+      currentIn,
+      newOut,
+      newBalance,
+      minAlert,
+      unit,
+      new Date().toISOString()
+    ]);
+
+    return sendMessage(
+      chatId,
+      `📤 Stock updated\n\n` +
+      `💊 Item: ${r[0]}\n` +
+      `➖ Qty: ${qty}\n` +
+      `📦 Balance: ${newBalance} ${unit}`
+    );
+  }
+
+  if (command === '/stock') {
+    if (parts.length < 2) {
+      return sendMessage(chatId, '⚠️ Usage:\n/stock | Item Name');
+    }
+
+    const itemName = clean(parts[1]);
+    const row = findRowIndex(data, itemName);
+
+    if (row === -1) {
+      return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+    }
+
+    const r = data[row];
+    const currentIn = Number(r[1] || 0);
+    const currentOut = Number(r[2] || 0);
+    const balance = Number(r[3] || 0);
+    const minAlert = Number(r[4] || 0);
+    const unit = r[5] || '';
+
+    return sendMessage(
+      chatId,
+      `📊 Stock Info\n\n` +
+      `💊 Item: ${r[0]}\n` +
+      `📥 In: ${currentIn}\n` +
+      `📤 Out: ${currentOut}\n` +
+      `📦 Balance: ${balance} ${unit}\n` +
+      `⚠️ MinAlert: ${minAlert}`
+    );
+  }
+
+  if (command === '/allstock') {
+    if (data.length === 0) {
+      return sendMessage(chatId, '📭 No stock data');
+    }
+
+    let msg = '📋 All Stock\n\n';
+
+    for (const r of data) {
+      const item = r[0] || '';
+      const balance = Number(r[3] || 0);
+      const minAlert = Number(r[4] || 0);
+      const unit = r[5] || '';
+      const status = balance <= minAlert ? ' 🚨LOW' : ' ✅';
+
+      msg += `💊 ${item}: ${balance} ${unit}${status}\n`;
+    }
+
+    return sendMessage(chatId, msg);
+  }
+
+  return sendMessage(chatId, '❌ Unknown command. Use /help');
+}
+
+/**************** WEBHOOK ****************/
+app.post('/webhook', async (req, res) => {
+  try {
+    const msg = req.body.message;
+
+    if (!msg || !msg.text) {
+      return res.sendStatus(200);
+    }
+
+    const chatId = msg.chat.id;
+    const text = msg.text;
+
+    await handleCommand(chatId, text);
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error('Webhook error:', err.message);
+    return res.sendStatus(200);
+  }
+});
+
+app.get('/', (req, res) => {
+  res.status(200).send('Bot running');
+});
+
+/**************** START SERVER ****************/
+const PORT = process.env.PORT || 10000;
+
+app.listen(PORT, async () => {
+  console.log('Server running on port ' + PORT);
+
+  try {
+    await setupSheet();
+    console.log('✅ setupSheet done');
+  } catch (err) {
+    console.error('❌ Setup error:', err.message);
+  }
+});
