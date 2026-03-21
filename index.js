@@ -41,7 +41,7 @@ function norm(t) {
 
 async function getData() {
   const res = await sheets.spreadsheets.values.get({
-    spreadsheetId: SPREADSHEET_ID,
+    spreadsheetId: '1wTsR0u2pJIoYSz9PpDwBGMxl177TLm4q7Cgu2uknXSg',
     range: 'Stock!A2:G'
   });
   return res.data.values || [];
@@ -53,7 +53,7 @@ function find(data, name) {
 
 async function update(row, values) {
   await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
+    spreadsheetId: '1wTsR0u2pJIoYSz9PpDwBGMxl177TLm4q7Cgu2uknXSg',
     range: `Stock!A${row + 2}:G${row + 2}`,
     valueInputOption: 'RAW',
     requestBody: { values: [values] }
@@ -71,7 +71,7 @@ async function handle(chatId, text) {
 
   if (cmd === '/additem') {
     await sheets.spreadsheets.values.append({
-      spreadsheetId: SPREADSHEET_ID,
+      spreadsheetId: '1wTsR0u2pJIoYSz9PpDwBGMxl177TLm4q7Cgu2uknXSg',
       range: 'Stock!A:G',
       valueInputOption: 'RAW',
       requestBody: { values: [[p[1],0,0,0,p[2],p[3],new Date()]] }
@@ -140,7 +140,7 @@ app.listen(PORT, async () => {
   }
 });
 async function setupSheet() {
-  const spreadsheetId = SPREADSHEET_ID;
+  const spreadsheetId = '1wTsR0u2pJIoYSz9PpDwBGMxl177TLm4q7Cgu2uknXSg';
 
   // 1. get sheet metadata
   const meta = await sheets.spreadsheets.get({
