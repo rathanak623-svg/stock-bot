@@ -22,6 +22,7 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
 const PORT = Number(process.env.PORT || 10000);
 const APP_TIMEZONE = process.env.APP_TIMEZONE || 'Asia/Phnom_Penh';
+
 const TELEGRAM_TIMEOUT_MS = getEnvNumber('TELEGRAM_TIMEOUT_MS', 15000, 1000);
 const SHEET_CACHE_TTL_MS = getEnvNumber('SHEET_CACHE_TTL_MS', 5000, 0);
 const PROCESSED_MESSAGE_TTL_MS = getEnvNumber('PROCESSED_MESSAGE_TTL_MS', 30 * 60 * 1000, 1000);
@@ -41,6 +42,8 @@ const DAILY_REPORT_HOUR = getEnvNumber('DAILY_REPORT_HOUR', 8, 0);
 const DAILY_REPORT_MINUTE = getEnvNumber('DAILY_REPORT_MINUTE', 0, 0);
 const DAILY_REPORT_CHECK_INTERVAL_MS = getEnvNumber('DAILY_REPORT_CHECK_INTERVAL_MS', 60 * 1000, 30 * 1000);
 
+const INPUT_SESSION_TIMEOUT_MS = getEnvNumber('INPUT_SESSION_TIMEOUT_MS', 10 * 60 * 1000, 60 * 1000);
+
 const BOOTSTRAP_SUPER_ADMINS = (process.env.SUPER_ADMINS || '')
   .split(',')
   .map(s => s.trim().toLowerCase())
@@ -48,7 +51,10 @@ const BOOTSTRAP_SUPER_ADMINS = (process.env.SUPER_ADMINS || '')
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
-const GROUP_BYPASS_COMMANDS = new Set(['/allowgroup', '/start', '/help', '/myrole', '/menu']);
+const GROUP_BYPASS_COMMANDS = new Set([
+  '/allowgroup', '/start', '/help', '/myrole', '/menu', '/cancelinput'
+]);
+
 const WRITE_COMMANDS = new Set([
   '/addsuperadmin', '/removesuperadmin',
   '/addadmin', '/removeadmin',
@@ -57,7 +63,8 @@ const WRITE_COMMANDS = new Set([
   '/additem', '/deleteitem', '/in', '/out', '/adjust',
   '/setalert', '/setunit', '/renameitem', '/confirm', '/cancel',
   '/undo', '/setdailyreport', '/setalerts',
-  '/additemsbulk', '/inbulk', '/outbulk'
+  '/additemsbulk', '/inbulk', '/outbulk',
+  '/report', '/exportsummary', '/exportlogs'
 ]);
 
 const telegramHttp = axios.create({
@@ -84,6 +91,7 @@ const processedMessageCache = new Map();
 const processedMessageInflight = new Set();
 const sheetIdCache = new Map();
 const rateLimitCache = new Map();
+const inputSessionCache = new Map();
 
 let spreadsheetMetaCache = {
   data: null,
@@ -91,11 +99,6 @@ let spreadsheetMetaCache = {
 };
 
 /**************** SIMPLE IN-MEMORY LOCKS ****************/
-/*
-  Note:
-  - Works for a single running instance.
-  - If you scale to multiple instances, move locking/state to external storage.
-*/
 const itemLocks = new Map();
 
 async function withLock(key, fn) {
@@ -256,8 +259,15 @@ function getUsername(msg) {
 function getActorIdentifier(msg) {
   const username = getUsername(msg);
   if (username) return `@${username}`;
-  const fallbackName = clean(msg?.from?.first_name || msg?.from?.last_name || '');
+
+  const fallbackName = clean(
+    [msg?.from?.first_name || '', msg?.from?.last_name || '']
+      .filter(Boolean)
+      .join(' ')
+  );
+
   if (fallbackName) return fallbackName;
+
   return `user_${msg?.from?.id || 'unknown'}`;
 }
 
@@ -283,6 +293,20 @@ function parseQtyAndOptionalNote(parts) {
   const qty = Number(parts[2]);
   const note = parts.length >= 4 ? clean(parts.slice(3).join(' | ')) : '';
   return { qty, note };
+}
+
+function parseOnOff(value) {
+  const v = norm(value);
+
+  if (v === 'on' || v === 'true' || v === '1' || v === 'yes' || v === 'enable' || v === 'enabled') {
+    return true;
+  }
+
+  if (v === 'off' || v === 'false' || v === '0' || v === 'no' || v === 'disable' || v === 'disabled') {
+    return false;
+  }
+
+  return null;
 }
 
 function getDailyReplyKeyboard(role) {
@@ -325,93 +349,61 @@ function buildPendingActionInlineKeyboard(code) {
 }
 
 function buildQuickActionsInlineKeyboard(role = 'guest') {
-  const rows = [
-    [
-      { text: '📥 IN', callback_data: 'QA|IN' },
-      { text: '📤 OUT', callback_data: 'QA|OUT' }
-    ],
-    [
-      { text: '📊 STOCK', callback_data: 'QA|STOCK' },
-      { text: '🚨 LOW STOCK', callback_data: 'QA|LOWSTOCK' }
-    ],
-    [
-      { text: '📈 DASHBOARD', callback_data: 'QA|DASHBOARD' },
-      { text: '📋 MENU', callback_data: 'QA|MENU' }
-    ]
-  ];
+  const rows = [];
 
   if (role === 'super_admin' || role === 'admin') {
-    rows.unshift([
+    rows.push([
       { text: '➕ ADD ITEM', callback_data: 'QA|ADDITEM' },
-      { text: '📥➕ IN BULK', callback_data: 'QA|INBULK' }
+      { text: '📥 IN', callback_data: 'QA|IN' }
     ]);
-    rows.splice(2, 0, [
-      { text: '📤➖ OUT BULK', callback_data: 'QA|OUTBULK' },
-      { text: '🗂 ALL STOCK', callback_data: 'QA|ALLSTOCK' }
+    rows.push([
+      { text: '📤 OUT', callback_data: 'QA|OUT' },
+      { text: '📊 STOCK', callback_data: 'QA|STOCK' }
     ]);
-  } else if (role === 'member') {
-    rows.splice(1, 0, [
+    rows.push([
       { text: '📥➕ IN BULK', callback_data: 'QA|INBULK' },
       { text: '📤➖ OUT BULK', callback_data: 'QA|OUTBULK' }
     ]);
-    rows.splice(3, 0, [
+    rows.push([
+      { text: '🚨 LOW STOCK', callback_data: 'QA|LOWSTOCK' },
       { text: '🗂 ALL STOCK', callback_data: 'QA|ALLSTOCK' }
     ]);
+    rows.push([
+      { text: '📈 DASHBOARD', callback_data: 'QA|DASHBOARD' },
+      { text: '📋 MENU', callback_data: 'QA|MENU' }
+    ]);
+  } else if (role === 'member') {
+    rows.push([
+      { text: '📥 IN', callback_data: 'QA|IN' },
+      { text: '📤 OUT', callback_data: 'QA|OUT' }
+    ]);
+    rows.push([
+      { text: '📊 STOCK', callback_data: 'QA|STOCK' },
+      { text: '📥➕ IN BULK', callback_data: 'QA|INBULK' }
+    ]);
+    rows.push([
+      { text: '📤➖ OUT BULK', callback_data: 'QA|OUTBULK' },
+      { text: '🚨 LOW STOCK', callback_data: 'QA|LOWSTOCK' }
+    ]);
+    rows.push([
+      { text: '🗂 ALL STOCK', callback_data: 'QA|ALLSTOCK' },
+      { text: '📈 DASHBOARD', callback_data: 'QA|DASHBOARD' }
+    ]);
+    rows.push([
+      { text: '📋 MENU', callback_data: 'QA|MENU' }
+    ]);
   } else {
-    rows.splice(1, 0, [
-      { text: '🗂 ALL STOCK', callback_data: 'QA|ALLSTOCK' }
+    rows.push([
+      { text: '📊 STOCK', callback_data: 'QA|STOCK' },
+      { text: '🚨 LOW STOCK', callback_data: 'QA|LOWSTOCK' }
+    ]);
+    rows.push([
+      { text: '🗂 ALL STOCK', callback_data: 'QA|ALLSTOCK' },
+      { text: '📋 MENU', callback_data: 'QA|MENU' }
     ]);
   }
 
   return { inline_keyboard: rows };
-}
-
-function buildForceReply(inputPlaceholder = '') {
-  return {
-    force_reply: true,
-    selective: true,
-    input_field_placeholder: inputPlaceholder
-  };
-}
-
-async function sendQuickActionsMenu(chatId, role = 'guest') {
-  await sendMessage(
-    chatId,
-    '⚡ Quick Actions',
-    { replyMarkup: buildQuickActionsInlineKeyboard(role) }
-  );
-}
-
-async function sendForceReplyPrompt(chatId, text, inputPlaceholder = '', replyToMessageId = null) {
-  await sendMessage(chatId, text, {
-    replyMarkup: buildForceReply(inputPlaceholder),
-    replyToMessageId
-  });
-}
-
-async function editMessageReplyMarkup(chatId, messageId, replyMarkup = null) {
-  try {
-    const payload = {
-      chat_id: chatId,
-      message_id: messageId
-    };
-
-    if (replyMarkup !== null) {
-      payload.reply_markup = replyMarkup;
-    }
-
-    await telegramHttp.post('/editMessageReplyMarkup', payload);
-  } catch (err) {
-    logError('Telegram editMessageReplyMarkup error:', err);
-  }
-}
-
-async function clearInlineKeyboardFromCallback(callbackQuery) {
-  const chatId = callbackQuery?.message?.chat?.id;
-  const messageId = callbackQuery?.message?.message_id;
-  if (!chatId || !messageId) return;
-
-  await editMessageReplyMarkup(chatId, messageId, { inline_keyboard: [] });
 }
 
 function buildCallbackMsgLike(callbackQuery) {
@@ -429,9 +421,9 @@ function getCallbackFeedback(resultMessage, fallbackOk = 'Done') {
   if (
     text.startsWith('Confirmed') ||
     text.startsWith('Cancelled') ||
+    text.startsWith('✅') ||
     text.startsWith('🗑️') ||
-    text.startsWith('🛠') ||
-    text.startsWith('✅')
+    text.startsWith('🛠')
   ) {
     return { text: fallbackOk, showAlert: false };
   }
@@ -449,54 +441,6 @@ function getCallbackFeedback(resultMessage, fallbackOk = 'Done') {
   }
 
   return { text: text.slice(0, 120) || fallbackOk, showAlert: false };
-}
-
-function detectQuickActionReply(msg) {
-  const replyText = clean(msg?.reply_to_message?.text || '');
-
-  if (!replyText) return null;
-
-  if (replyText.includes('/additem | Item Name | MinAlert | Unit')) return 'ADDITEM';
-  if (replyText.includes('/inbulk')) return 'INBULK';
-  if (replyText.includes('/outbulk')) return 'OUTBULK';
-  if (replyText.includes('/in | Item Name | Qty | Optional Note')) return 'IN';
-  if (replyText.includes('/out | Item Name | Qty | Optional Note')) return 'OUT';
-  if (replyText.includes('/stock | Item Name')) return 'STOCK';
-
-  return null;
-}
-
-function transformQuickReplyToCommand(msg) {
-  const action = detectQuickActionReply(msg);
-  if (!action) return null;
-
-  const raw = clean(msg.text || '');
-  if (!raw) return null;
-
-  if (raw.startsWith('/')) {
-    return raw;
-  }
-
-  if (action === 'ADDITEM') {
-    return `/additem | ${raw}`;
-  }
-  if (action === 'IN') {
-    return `/in | ${raw}`;
-  }
-  if (action === 'OUT') {
-    return `/out | ${raw}`;
-  }
-  if (action === 'STOCK') {
-    return `/stock | ${raw}`;
-  }
-  if (action === 'INBULK') {
-    return `/inbulk\n${String(msg.text || '').trim()}`;
-  }
-  if (action === 'OUTBULK') {
-    return `/outbulk\n${String(msg.text || '').trim()}`;
-  }
-
-  return null;
 }
 
 async function sendMessage(chatId, text, options = {}) {
@@ -550,35 +494,87 @@ async function sendDocument(chatId, filename, content) {
   }
 }
 
+async function editMessageReplyMarkup(chatId, messageId, replyMarkup = null) {
+  try {
+    const payload = {
+      chat_id: chatId,
+      message_id: messageId
+    };
+
+    if (replyMarkup !== null) {
+      payload.reply_markup = replyMarkup;
+    }
+
+    await telegramHttp.post('/editMessageReplyMarkup', payload);
+  } catch (err) {
+    logError('Telegram editMessageReplyMarkup error:', err);
+  }
+}
+
+async function clearInlineKeyboardFromCallback(callbackQuery) {
+  const chatId = callbackQuery?.message?.chat?.id;
+  const messageId = callbackQuery?.message?.message_id;
+  if (!chatId || !messageId) return;
+  await editMessageReplyMarkup(chatId, messageId, { inline_keyboard: [] });
+}
+
 function chunkMessage(text, maxLen = 3500) {
-  const lines = String(text || '').split('\n');
+  const input = String(text || '');
+  if (!input) return [''];
+
+  const lines = input.split('\n');
   const chunks = [];
   let current = '';
 
-  for (const line of lines) {
-    if ((current + '\n' + line).length > maxLen) {
-      if (current) chunks.push(current);
+  const pushCurrent = () => {
+    if (current) {
+      chunks.push(current);
+      current = '';
+    }
+  };
+
+  for (let line of lines) {
+    if (line.length > maxLen) {
+      pushCurrent();
+
+      while (line.length > maxLen) {
+        chunks.push(line.slice(0, maxLen));
+        line = line.slice(maxLen);
+      }
+
+      if (line) current = line;
+      continue;
+    }
+
+    const candidate = current ? `${current}\n${line}` : line;
+
+    if (candidate.length > maxLen) {
+      pushCurrent();
       current = line;
     } else {
-      current += (current ? '\n' : '') + line;
+      current = candidate;
     }
   }
 
-  if (current) chunks.push(current);
-  return chunks;
+  pushCurrent();
+  return chunks.length ? chunks : [''];
 }
 
 async function sendLongMessage(chatId, text, options = {}) {
   const chunks = chunkMessage(text);
-
   for (let i = 0; i < chunks.length; i++) {
     const isLast = i === chunks.length - 1;
-
     await sendMessage(chatId, chunks[i], {
       replyMarkup: isLast ? options.replyMarkup : undefined,
       replyToMessageId: isLast ? options.replyToMessageId : undefined
     });
   }
+}
+
+async function sendQuickActionsMenu(chatId, role = 'guest') {
+  await sendMessage(chatId, '⚡ Quick Actions', {
+    replyMarkup: buildQuickActionsInlineKeyboard(role)
+  });
 }
 
 function findRowIndex(data, itemName) {
@@ -646,12 +642,8 @@ function getActorContext(msg) {
 }
 
 function canConfirmPending(role, action) {
-  if (action === 'deleteitem') {
-    return role === 'super_admin' || role === 'admin';
-  }
-  if (action === 'adjust') {
-    return role === 'super_admin';
-  }
+  if (action === 'deleteitem') return role === 'super_admin' || role === 'admin';
+  if (action === 'adjust') return role === 'super_admin';
   return false;
 }
 
@@ -686,7 +678,6 @@ function hasProcessedMessageKey(key) {
 
 function beginProcessedMessage(messageId, chatId) {
   if (!messageId) return null;
-
   const key = buildProcessedMessageKey(messageId, chatId);
   pruneProcessedMessageCache();
 
@@ -699,9 +690,7 @@ function beginProcessedMessage(messageId, chatId) {
 }
 
 function releaseProcessedMessage(key) {
-  if (key) {
-    processedMessageInflight.delete(key);
-  }
+  if (key) processedMessageInflight.delete(key);
 }
 
 function rememberProcessedMessage(key) {
@@ -724,9 +713,7 @@ async function safeMarkProcessedMessage({ messageId, chatId, command, key }) {
 
 async function acquireWriteCommandGuard(messageId, chatId) {
   const key = beginProcessedMessage(messageId, chatId);
-  if (!key) {
-    return { ok: false, reason: 'duplicate_memory' };
-  }
+  if (!key) return { ok: false, reason: 'duplicate_memory' };
 
   try {
     const alreadyProcessed = await isMessageProcessed(messageId, chatId);
@@ -734,7 +721,6 @@ async function acquireWriteCommandGuard(messageId, chatId) {
       releaseProcessedMessage(key);
       return { ok: false, reason: 'duplicate_sheet' };
     }
-
     return { ok: true, key };
   } catch (err) {
     releaseProcessedMessage(key);
@@ -767,32 +753,197 @@ function pruneRateLimitCache() {
   }
 }
 
-async function getStockRowByItemName(itemName) {
-  const data = await getData();
-  const rowIndex = findRowIndex(data, itemName);
-  if (rowIndex === -1) return null;
-
-  return {
-    data,
-    rowIndex,
-    row: data[rowIndex],
-    stock: getStockRowObject(data[rowIndex])
-  };
+/**************** INPUT SESSIONS ****************/
+function getUserSessionKey(msg) {
+  return `${msg?.chat?.id || ''}:${msg?.from?.id || ''}`;
 }
 
-function parseMultilineEntries(rawText) {
-  return String(rawText || '')
-    .split(/\r?\n/)
-    .slice(1)
-    .map(line => clean(line))
-    .filter(Boolean);
+function getInputSession(msg) {
+  const key = getUserSessionKey(msg);
+  const session = inputSessionCache.get(key);
+  if (!session) return null;
+
+  if (Date.now() - Number(session.updatedAt || 0) > INPUT_SESSION_TIMEOUT_MS) {
+    inputSessionCache.delete(key);
+    return null;
+  }
+
+  return session;
 }
 
-function parseOnOff(value) {
-  const v = norm(value);
-  if (['on', 'true', '1', 'yes', 'enable', 'enabled'].includes(v)) return true;
-  if (['off', 'false', '0', 'no', 'disable', 'disabled'].includes(v)) return false;
+function setInputSession(msg, session) {
+  inputSessionCache.set(getUserSessionKey(msg), {
+    ...session,
+    updatedAt: Date.now()
+  });
+}
+
+function clearInputSession(msg) {
+  inputSessionCache.delete(getUserSessionKey(msg));
+}
+
+function buildSessionPrompt(action, step) {
+  const cancelHint = '\n\nវាយ /cancelinput ដើម្បីបោះបង់';
+
+  if (action === 'ADDITEM') {
+    if (step === 'itemName') return `➕ បន្ថែម Item\n\nសូមបញ្ចូលឈ្មោះ Item${cancelHint}`;
+    if (step === 'minAlert') return `➕ បន្ថែម Item\n\nសូមបញ្ចូល MinAlert${cancelHint}`;
+    if (step === 'unit') return `➕ បន្ថែម Item\n\nសូមបញ្ចូល Unit${cancelHint}`;
+  }
+
+  if (action === 'IN') {
+    if (step === 'itemName') return `📥 បញ្ចូលស្តុក\n\nសូមបញ្ចូលឈ្មោះ Item${cancelHint}`;
+    if (step === 'qty') return `📥 បញ្ចូលស្តុក\n\nសូមបញ្ចូល Qty${cancelHint}`;
+    if (step === 'note') return `📥 បញ្ចូលស្តុក\n\nសូមបញ្ចូល Note ឬវាយ -${cancelHint}`;
+  }
+
+  if (action === 'OUT') {
+    if (step === 'itemName') return `📤 ដកស្តុក\n\nសូមបញ្ចូលឈ្មោះ Item${cancelHint}`;
+    if (step === 'qty') return `📤 ដកស្តុក\n\nសូមបញ្ចូល Qty${cancelHint}`;
+    if (step === 'note') return `📤 ដកស្តុក\n\nសូមបញ្ចូល Note ឬវាយ -${cancelHint}`;
+  }
+
+  if (action === 'STOCK') {
+    if (step === 'itemName') return `📊 មើលស្តុក\n\nសូមបញ្ចូលឈ្មោះ Item${cancelHint}`;
+  }
+
+  return `សូមបញ្ចូលទិន្នន័យ${cancelHint}`;
+}
+
+function getSessionValidationError(action, step, value) {
+  const v = clean(value);
+
+  if (step === 'itemName') {
+    if (!isValidItemName(v)) {
+      return '⚠️ ឈ្មោះ Item មិនត្រឹមត្រូវ\n- មិនអាចទទេ\n- មិនអាចមាន | \n- មិនអាចមាន newline';
+    }
+    return null;
+  }
+
+  if (action === 'ADDITEM' && step === 'minAlert') {
+    const n = Number(v);
+    if (Number.isNaN(n) || n < 0) {
+      return '⚠️ MinAlert ត្រូវជាលេខ ហើយត្រូវ >= 0';
+    }
+    return null;
+  }
+
+  if ((action === 'IN' || action === 'OUT') && step === 'qty') {
+    const n = Number(v);
+    if (!assertValidQty(n)) {
+      return '⚠️ Qty ត្រូវជាលេខ ហើយត្រូវ > 0';
+    }
+    return null;
+  }
+
+  if (action === 'ADDITEM' && step === 'unit') {
+    if (!isValidUnit(v)) {
+      return '⚠️ Unit មិនត្រឹមត្រូវ';
+    }
+    return null;
+  }
+
   return null;
+}
+
+function getSessionNextStep(action, currentStep) {
+  if (action === 'ADDITEM') {
+    if (currentStep === 'itemName') return 'minAlert';
+    if (currentStep === 'minAlert') return 'unit';
+    return null;
+  }
+
+  if (action === 'IN' || action === 'OUT') {
+    if (currentStep === 'itemName') return 'qty';
+    if (currentStep === 'qty') return 'note';
+    return null;
+  }
+
+  if (action === 'STOCK') {
+    if (currentStep === 'itemName') return null;
+  }
+
+  return null;
+}
+
+function buildCommandFromSession(session) {
+  const data = session.data || {};
+
+  if (session.action === 'ADDITEM') {
+    return `/additem | ${data.itemName} | ${data.minAlert} | ${data.unit}`;
+  }
+  if (session.action === 'IN') {
+    return `/in | ${data.itemName} | ${data.qty}${data.note ? ` | ${data.note}` : ''}`;
+  }
+  if (session.action === 'OUT') {
+    return `/out | ${data.itemName} | ${data.qty}${data.note ? ` | ${data.note}` : ''}`;
+  }
+  if (session.action === 'STOCK') {
+    return `/stock | ${data.itemName}`;
+  }
+
+  return null;
+}
+
+async function processInputSessionMessage(msg) {
+  const session = getInputSession(msg);
+  if (!session) return false;
+
+  const text = clean(msg.text || '');
+  if (!text) {
+    await sendMessage(msg.chat.id, buildSessionPrompt(session.action, session.step));
+    return true;
+  }
+
+  const validationError = getSessionValidationError(session.action, session.step, text);
+  if (validationError) {
+    await sendMessage(msg.chat.id, `${validationError}\n\n${buildSessionPrompt(session.action, session.step)}`);
+    return true;
+  }
+
+  const nextSession = {
+    ...session,
+    data: { ...(session.data || {}) }
+  };
+
+  if (session.action === 'ADDITEM') {
+    if (session.step === 'itemName') nextSession.data.itemName = text;
+    if (session.step === 'minAlert') nextSession.data.minAlert = Number(text);
+    if (session.step === 'unit') nextSession.data.unit = text;
+  }
+
+  if (session.action === 'IN' || session.action === 'OUT') {
+    if (session.step === 'itemName') nextSession.data.itemName = text;
+    if (session.step === 'qty') nextSession.data.qty = Number(text);
+    if (session.step === 'note') nextSession.data.note = text === '-' ? '' : text;
+  }
+
+  if (session.action === 'STOCK') {
+    if (session.step === 'itemName') nextSession.data.itemName = text;
+  }
+
+  const nextStep = getSessionNextStep(session.action, session.step);
+  if (nextStep) {
+    nextSession.step = nextStep;
+    setInputSession(msg, nextSession);
+    await sendMessage(msg.chat.id, buildSessionPrompt(nextSession.action, nextStep));
+    return true;
+  }
+
+  clearInputSession(msg);
+
+  const builtCommand = buildCommandFromSession(nextSession);
+  if (!builtCommand) {
+    await sendMessage(msg.chat.id, '❌ Failed to build action');
+    return true;
+  }
+
+  await handleCommand({
+    ...msg,
+    text: builtCommand
+  });
+
+  return true;
 }
 
 /**************** SHEET CONFIG ****************/
@@ -836,9 +987,7 @@ function primeRowCache(cacheKey, value, ttlMs = SHEET_CACHE_TTL_MS) {
 }
 
 function invalidateRowCache(cacheKey) {
-  if (cacheKey) {
-    rowCache.delete(cacheKey);
-  }
+  if (cacheKey) rowCache.delete(cacheKey);
 }
 
 function invalidateSheetCache(sheetTitle) {
@@ -894,14 +1043,10 @@ async function getSpreadsheetMeta(options = {}) {
 }
 
 async function getSheetId(sheetTitle) {
-  if (sheetIdCache.has(sheetTitle)) {
-    return sheetIdCache.get(sheetTitle);
-  }
+  if (sheetIdCache.has(sheetTitle)) return sheetIdCache.get(sheetTitle);
 
   await getSpreadsheetMeta();
-  if (sheetIdCache.has(sheetTitle)) {
-    return sheetIdCache.get(sheetTitle);
-  }
+  if (sheetIdCache.has(sheetTitle)) return sheetIdCache.get(sheetTitle);
 
   throw new Error(`${sheetTitle} sheet not found`);
 }
@@ -911,9 +1056,7 @@ async function ensureSheetsExist(titles) {
   const existingTitles = new Set((meta.sheets || []).map(sheet => sheet.properties?.title).filter(Boolean));
   const missingTitles = titles.filter(title => !existingTitles.has(title));
 
-  if (missingTitles.length === 0) {
-    return meta;
-  }
+  if (missingTitles.length === 0) return meta;
 
   await sheets.spreadsheets.batchUpdate({
     spreadsheetId: SPREADSHEET_ID,
@@ -1098,6 +1241,7 @@ async function deleteRowFromSheet(sheetTitle, rowIndexZeroBasedWithoutHeader) {
 
 async function deleteRowsFromSheet(sheetTitle, rowIndexesZeroBasedWithoutHeader) {
   if (!rowIndexesZeroBasedWithoutHeader || rowIndexesZeroBasedWithoutHeader.length === 0) return;
+
   const sheetId = await getSheetId(sheetTitle);
   const sorted = [...new Set(rowIndexesZeroBasedWithoutHeader)].sort((a, b) => b - a);
 
@@ -1118,6 +1262,21 @@ async function deleteRowsFromSheet(sheetTitle, rowIndexesZeroBasedWithoutHeader)
   });
 
   invalidateSheetCache(sheetTitle);
+}
+
+async function getStockRowByItemName(itemName) {
+  const safeName = clean(itemName);
+  if (!safeName) return null;
+
+  const data = await getData();
+  const rowIndex = findRowIndex(data, safeName);
+
+  if (rowIndex === -1) return null;
+
+  return {
+    rowIndex,
+    row: data[rowIndex]
+  };
 }
 
 /**************** GROUP SETTINGS ****************/
@@ -1256,6 +1415,7 @@ async function upsertRole(username, role) {
       requestBody: { values: [values] }
     });
   }
+
   invalidateSheetCache('Roles');
 }
 
@@ -1291,6 +1451,7 @@ async function addAllowedChat(chatId, chatTitle, chatType) {
       values: [[String(chatId), clean(chatTitle), clean(chatType), nowIso()]]
     }
   });
+
   invalidateSheetCache('AllowedChats');
   return true;
 }
@@ -1487,7 +1648,7 @@ const ROLE_COMMANDS = {
     '/history', '/today', '/report', '/exportsummary', '/adjust',
     '/search', '/exportlogs', '/confirm', '/cancel',
     '/undo', '/dashboard', '/itemlogs', '/audit',
-    '/health', '/stats',
+    '/health', '/stats', '/cancelinput',
     '/setdailyreport', '/setalerts',
     '/additemsbulk', '/inbulk', '/outbulk'
   ]),
@@ -1497,7 +1658,7 @@ const ROLE_COMMANDS = {
     '/in', '/out', '/stock', '/allstock', '/alertstock', '/lowstock',
     '/search', '/exportlogs', '/confirm', '/cancel',
     '/undo', '/dashboard', '/itemlogs',
-    '/health', '/stats',
+    '/health', '/stats', '/cancelinput',
     '/setdailyreport', '/setalerts',
     '/additemsbulk', '/inbulk', '/outbulk',
     '/today'
@@ -1507,7 +1668,7 @@ const ROLE_COMMANDS = {
     '/in', '/out', '/inbulk', '/outbulk',
     '/stock', '/allstock', '/alertstock', '/lowstock',
     '/search', '/confirm', '/cancel',
-    '/dashboard', '/itemlogs',
+    '/dashboard', '/itemlogs', '/cancelinput',
     '/today'
   ])
 };
@@ -1629,9 +1790,7 @@ async function executeConfirmedAction(pending, msg, role, actorCtx) {
       return await withLock(`stock:${itemName}`, async () => {
         const data = await getData();
         const row = findRowIndex(data, itemName);
-        if (row === -1) {
-          throw new Error(`Item not found: ${itemName}`);
-        }
+        if (row === -1) throw new Error(`Item not found: ${itemName}`);
 
         await deleteRowFromSheet('Stock', row);
         await runNonCriticalTask('Append report error:', () =>
@@ -1654,9 +1813,7 @@ async function executeConfirmedAction(pending, msg, role, actorCtx) {
       return await withLock(`stock:${itemName}`, async () => {
         const data = await getData();
         const row = findRowIndex(data, itemName);
-        if (row === -1) {
-          throw new Error(`Item not found: ${itemName}`);
-        }
+        if (row === -1) throw new Error(`Item not found: ${itemName}`);
 
         const r = data[row];
         const currentIn = toNumber(r[1]);
@@ -1715,19 +1872,13 @@ async function undoLastAction(itemName, actorCtx, role) {
   return await withStockSheetWriteLock(async () => {
     return await withLock(`stock:${itemName}`, async () => {
       const stockRef = await getStockRowByItemName(itemName);
-      if (!stockRef) {
-        throw new Error(`Item not found: ${itemName}`);
-      }
+      if (!stockRef) throw new Error(`Item not found: ${itemName}`);
 
       const lastLog = await getLastUndoableLogForItem(itemName);
-      if (!lastLog) {
-        throw new Error(`No undoable IN/OUT history found for: ${itemName}`);
-      }
+      if (!lastLog) throw new Error(`No undoable IN/OUT history found for: ${itemName}`);
 
       const actionTs = new Date(clean(lastLog.row[0] || '')).getTime();
-      if (Number.isNaN(actionTs)) {
-        throw new Error('Last log timestamp is invalid');
-      }
+      if (Number.isNaN(actionTs)) throw new Error('Last log timestamp is invalid');
 
       if (Date.now() - actionTs > UNDO_WINDOW_MINUTES * 60 * 1000) {
         throw new Error(`Undo window expired. Allowed within ${UNDO_WINDOW_MINUTES} minutes`);
@@ -1927,6 +2078,7 @@ async function processBulkMovement(entries, mode, actorCtx, role) {
 async function sendDailyLowStockSummariesIfDue() {
   const now = new Date();
   const parts = getTimeParts(APP_TIMEZONE, now);
+
   if (parts.hour !== DAILY_REPORT_HOUR || parts.minute !== DAILY_REPORT_MINUTE) {
     return;
   }
@@ -1940,12 +2092,15 @@ async function sendDailyLowStockSummariesIfDue() {
     const chatTitle = clean(chat[1] || '');
     if (!chatId) continue;
 
-    const setting = await getGroupSetting(chatId);
-    if (!setting.dailyReportEnabled) continue;
-    if (setting.lastDailyReportDate === today) continue;
+    await withLock(`daily-report:${chatId}:${today}`, async () => {
+      const setting = await getGroupSetting(chatId);
 
-    await sendLongMessage(chatId, msg);
-    await markDailyReportSent(chatId, chatTitle, today);
+      if (!setting.dailyReportEnabled) return;
+      if (setting.lastDailyReportDate === today) return;
+
+      await sendLongMessage(chatId, msg);
+      await markDailyReportSent(chatId, chatTitle, today);
+    });
   }
 }
 
@@ -1984,6 +2139,7 @@ async function buildHealthMessage() {
     `💬 Allowed Chats: ${allowedChats.length}\n` +
     `⚙️ Group Settings Rows: ${groupSettings.length}\n\n` +
     `🗂 In-memory processed cache: ${processedMessageCache.size}\n` +
+    `🧠 Input sessions: ${inputSessionCache.size}\n` +
     `🚦 Rate limit buckets: ${rateLimitCache.size}\n` +
     `🔒 Active locks: ${itemLocks.size}`
   );
@@ -2005,9 +2161,7 @@ async function confirmPendingActionByCode(code, msg, role, actorCtx) {
       return 'Confirmation code expired';
     }
 
-    if (validation) {
-      return validation;
-    }
+    if (validation) return validation;
 
     if (!canConfirmPending(role, pending.action)) {
       return `You no longer have permission to confirm "${pending.action}"`;
@@ -2041,9 +2195,7 @@ async function cancelPendingActionByCode(code, actorCtx) {
       return 'Confirmation code expired';
     }
 
-    if (validation) {
-      return validation;
-    }
+    if (validation) return validation;
 
     await updatePendingActionStatus(pending.rowIndex, 'cancelled');
     return `Cancelled\nCode: ${code}`;
@@ -2052,10 +2204,7 @@ async function cancelPendingActionByCode(code, actorCtx) {
 
 /**************** COMMAND HANDLER ****************/
 async function handleCommand(msg) {
-  const transformedQuickReply = transformQuickReplyToCommand(msg);
-  const effectiveText = transformedQuickReply || String(msg.text || '');
-
-  const rawText = effectiveText;
+  const rawText = String(msg.text || '');
   const lines = String(rawText).split(/\r?\n/).map(s => clean(s)).filter(Boolean);
   const headerLine = lines[0] || '';
   const parts = parsePipe(headerLine);
@@ -2091,10 +2240,7 @@ async function handleCommand(msg) {
   }
 
   async function markProcessedIfNeeded() {
-    if (!processedMessageKey || processedMessageMarked) {
-      return;
-    }
-
+    if (!processedMessageKey || processedMessageMarked) return;
     processedMessageMarked = true;
     await safeMarkProcessedMessage({
       messageId: msg.message_id,
@@ -2131,8 +2277,30 @@ async function handleCommand(msg) {
       );
     }
 
-    /************ HELP / START / MENU ************/
-    if (command === '/start' || command === '/help' || command === '/menu') {
+    /************ CANCEL INPUT ************/
+    if (command === '/cancelinput') {
+      const existing = getInputSession(msg);
+      clearInputSession(msg);
+      return sendMessage(
+        chatId,
+        existing ? '✅ បានបោះបង់ input flow ហើយ' : 'ℹ️ មិនមាន input flow កំពុងដំណើរការ'
+      );
+    }
+
+    /************ MENU ONLY ************/
+    if (command === '/menu') {
+      clearInputSession(msg);
+      await sendMessage(chatId, '📌 Daily menu is ready', {
+        replyMarkup: replyKeyboard
+      });
+      await sendQuickActionsMenu(chatId, role);
+      return;
+    }
+
+    /************ HELP / START ************/
+    if (command === '/start' || command === '/help') {
+      clearInputSession(msg);
+
       if (role === 'super_admin') {
         await sendLongMessage(
           chatId,
@@ -2176,7 +2344,8 @@ async function handleCommand(msg) {
           '/exportsummary\n' +
           '/exportlogs\n' +
           '/confirm | CODE\n' +
-          '/cancel | CODE'
+          '/cancel | CODE\n' +
+          '/cancelinput'
         );
         await sendMessage(chatId, '📌 Daily menu is ready', { replyMarkup: replyKeyboard });
         await sendQuickActionsMenu(chatId, role);
@@ -2212,7 +2381,8 @@ async function handleCommand(msg) {
           '/exportsummary\n' +
           '/exportlogs\n' +
           '/confirm | CODE\n' +
-          '/cancel | CODE'
+          '/cancel | CODE\n' +
+          '/cancelinput'
         );
         await sendMessage(chatId, '📌 Daily menu is ready', { replyMarkup: replyKeyboard });
         await sendQuickActionsMenu(chatId, role);
@@ -2238,7 +2408,8 @@ async function handleCommand(msg) {
           '/today\n' +
           '/itemlogs | Item | limit\n' +
           '/confirm | CODE\n' +
-          '/cancel | CODE'
+          '/cancel | CODE\n' +
+          '/cancelinput'
         );
         await sendMessage(chatId, '📌 Daily menu is ready', { replyMarkup: replyKeyboard });
         await sendQuickActionsMenu(chatId, role);
@@ -2261,7 +2432,6 @@ async function handleCommand(msg) {
     }
 
     if (command === '/roles') {
-      const rows = roleRows;
       let msgOut = '👥 Roles\n\n';
 
       if (BOOTSTRAP_SUPER_ADMINS.length > 0) {
@@ -2272,13 +2442,13 @@ async function handleCommand(msg) {
         msgOut += '\n';
       }
 
-      if (rows.length === 0) {
+      if (roleRows.length === 0) {
         msgOut += 'No sheet roles yet.';
         return sendMessage(chatId, msgOut);
       }
 
       const groups = { super_admin: [], admin: [], member: [] };
-      for (const r of rows) {
+      for (const r of roleRows) {
         const u = cleanUsername(r[0]);
         const rr = norm(r[1]);
         if (groups[rr]) groups[rr].push(u);
@@ -2292,11 +2462,10 @@ async function handleCommand(msg) {
     }
 
     if (command === '/groups') {
-      const rows = allowedChatRows;
-      if (rows.length === 0) return sendMessage(chatId, '📭 No allowed groups yet');
+      if (allowedChatRows.length === 0) return sendMessage(chatId, '📭 No allowed groups yet');
 
       let msgOut = '📋 Allowed Groups\n\n';
-      for (const r of rows) {
+      for (const r of allowedChatRows) {
         const setting = await getGroupSetting(r[0]);
         msgOut +=
           `🆔 ${r[0]}\n` +
@@ -2475,7 +2644,12 @@ async function handleCommand(msg) {
     }
 
     if (command === '/additemsbulk') {
-      const entries = parseMultilineEntries(rawText);
+      const entries = String(rawText || '')
+        .split(/\r?\n/)
+        .slice(1)
+        .map(line => clean(line))
+        .filter(Boolean);
+
       if (entries.length === 0) {
         return sendLongMessage(chatId, '⚠️ Usage:\n/additemsbulk\nItem | MinAlert | Unit\nItem2 | MinAlert | Unit');
       }
@@ -2486,7 +2660,12 @@ async function handleCommand(msg) {
     }
 
     if (command === '/inbulk') {
-      const entries = parseMultilineEntries(rawText);
+      const entries = String(rawText || '')
+        .split(/\r?\n/)
+        .slice(1)
+        .map(line => clean(line))
+        .filter(Boolean);
+
       if (entries.length === 0) {
         return sendLongMessage(chatId, '⚠️ Usage:\n/inbulk\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note');
       }
@@ -2497,7 +2676,12 @@ async function handleCommand(msg) {
     }
 
     if (command === '/outbulk') {
-      const entries = parseMultilineEntries(rawText);
+      const entries = String(rawText || '')
+        .split(/\r?\n/)
+        .slice(1)
+        .map(line => clean(line))
+        .filter(Boolean);
+
       if (entries.length === 0) {
         return sendLongMessage(chatId, '⚠️ Usage:\n/outbulk\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note');
       }
@@ -2831,10 +3015,7 @@ async function handleCommand(msg) {
             appendReport('SET_UNIT', `By=${actor}, Item=${r[0]}, Unit=${unit}`)
           );
 
-          return sendMessage(
-            chatId,
-            `✅ Unit Updated\n\n💊 Item: ${r[0]}\n📦 New Unit: ${unit}`
-          );
+          return sendMessage(chatId, `✅ Unit Updated\n\n💊 Item: ${r[0]}\n📦 New Unit: ${unit}`);
         });
       });
     }
@@ -2881,6 +3062,7 @@ async function handleCommand(msg) {
             await runNonCriticalTask('Append report error:', () =>
               appendReport('RENAME_ITEM', `By=${actor}, ${oldName} -> ${newName}`)
             );
+
             return sendMessage(chatId, `✅ Item Renamed\n\n📝 Old: ${oldName}\n✨ New: ${newName}`);
           });
         });
@@ -2894,25 +3076,27 @@ async function handleCommand(msg) {
       if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
 
       return await withStockSheetWriteLock(async () => {
-        const data = await getData();
-        const row = findRowIndex(data, itemName);
-        if (row === -1) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+        return await withLock(`stock:${itemName}`, async () => {
+          const data = await getData();
+          const row = findRowIndex(data, itemName);
+          if (row === -1) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
 
-        const pending = await createPendingAction(username, actorCtx.userId, chatId, 'deleteitem', {
-          itemName
+          const pending = await createPendingAction(username, actorCtx.userId, chatId, 'deleteitem', {
+            itemName
+          });
+          await markProcessedIfNeeded();
+
+          return sendMessage(
+            chatId,
+            `⚠️ Confirm Delete Required\n\n` +
+            `💊 Item: ${itemName}\n\n` +
+            `🧾 Code: ${pending.code}\n` +
+            `⏳ Expires in ${CONFIRM_EXPIRE_MINUTES} minutes\n\n` +
+            `Confirm:\n/confirm | ${pending.code}\n\n` +
+            `Cancel:\n/cancel | ${pending.code}`,
+            { replyMarkup: buildPendingActionInlineKeyboard(pending.code) }
+          );
         });
-        await markProcessedIfNeeded();
-
-        return sendMessage(
-          chatId,
-          `⚠️ Confirm Delete Required\n\n` +
-          `💊 Item: ${itemName}\n\n` +
-          `🧾 Code: ${pending.code}\n` +
-          `⏳ Expires in ${CONFIRM_EXPIRE_MINUTES} minutes\n\n` +
-          `Confirm:\n/confirm | ${pending.code}\n\n` +
-          `Cancel:\n/cancel | ${pending.code}`,
-          { replyMarkup: buildPendingActionInlineKeyboard(pending.code) }
-        );
       });
     }
 
@@ -3044,6 +3228,7 @@ async function handleCommand(msg) {
         msgOut += '✅ No low stock items';
       }
 
+      await markProcessedIfNeeded();
       await appendReport(
         'REPORT_VIEW',
         `By=${actor}, TotalItems=${summary.totalItems}, LowStock=${summary.lowStockCount}, TotalBalance=${summary.totalBalance}`
@@ -3147,6 +3332,7 @@ async function handleCommand(msg) {
       }
 
       const csv = rows.map(row => row.map(escapeCsv).join(',')).join('\n');
+      await markProcessedIfNeeded();
       await appendReport('EXPORT_SUMMARY', `By=${actor}, Exported ${data.length} items`);
 
       return sendDocument(chatId, `stock-summary-${getLocalDateString(APP_TIMEZONE)}.csv`, csv);
@@ -3179,6 +3365,7 @@ async function handleCommand(msg) {
       }
 
       const csv = rows.map(row => row.map(escapeCsv).join(',')).join('\n');
+      await markProcessedIfNeeded();
       await appendReport('EXPORT_LOGS', `By=${actor}, Exported ${logs.length} logs`);
 
       return sendDocument(chatId, `stock-logs-${getLocalDateString(APP_TIMEZONE)}.csv`, csv);
@@ -3210,7 +3397,6 @@ async function handleCallbackQuery(callbackQuery) {
   const [roleRows, allowedChatRows] = await Promise.all([getRoles(), getAllowedChats()]);
   const role = getUserRoleFromRows(username, roleRows);
 
-  // QUICK ACTIONS
   if (data.startsWith('QA|')) {
     const quickAction = clean(data.split('|')[1] || '');
 
@@ -3228,13 +3414,10 @@ async function handleCallbackQuery(callbackQuery) {
         await answerCallbackQuery(callbackId, 'You are not allowed', true);
         return;
       }
+      clearInputSession(msg);
+      setInputSession(msg, { action: 'ADDITEM', step: 'itemName', data: {} });
       await answerCallbackQuery(callbackId, 'Add item');
-      await sendForceReplyPrompt(
-        chatId,
-        'សូម reply តាម format ខាងក្រោម:\nItem Name | MinAlert | Unit',
-        'Paracetamol | 10 | box',
-        msg.message_id
-      );
+      await sendMessage(chatId, buildSessionPrompt('ADDITEM', 'itemName'));
       return;
     }
 
@@ -3243,13 +3426,10 @@ async function handleCallbackQuery(callbackQuery) {
         await answerCallbackQuery(callbackId, 'You are not allowed', true);
         return;
       }
-      await answerCallbackQuery(callbackId, 'បញ្ចូលស្តុក');
-      await sendForceReplyPrompt(
-        chatId,
-        'សូម reply តាម format ខាងក្រោម:\nItem Name | Qty | Optional Note',
-        'Paracetamol | 10 | received',
-        msg.message_id
-      );
+      clearInputSession(msg);
+      setInputSession(msg, { action: 'IN', step: 'itemName', data: {} });
+      await answerCallbackQuery(callbackId, 'IN');
+      await sendMessage(chatId, buildSessionPrompt('IN', 'itemName'));
       return;
     }
 
@@ -3258,13 +3438,22 @@ async function handleCallbackQuery(callbackQuery) {
         await answerCallbackQuery(callbackId, 'You are not allowed', true);
         return;
       }
-      await answerCallbackQuery(callbackId, 'ដកស្តុក');
-      await sendForceReplyPrompt(
-        chatId,
-        'សូម reply តាម format ខាងក្រោម:\nItem Name | Qty | Optional Note',
-        'Paracetamol | 5 | used',
-        msg.message_id
-      );
+      clearInputSession(msg);
+      setInputSession(msg, { action: 'OUT', step: 'itemName', data: {} });
+      await answerCallbackQuery(callbackId, 'OUT');
+      await sendMessage(chatId, buildSessionPrompt('OUT', 'itemName'));
+      return;
+    }
+
+    if (quickAction === 'STOCK') {
+      if (!canUseCommand(role, '/stock')) {
+        await answerCallbackQuery(callbackId, 'You are not allowed', true);
+        return;
+      }
+      clearInputSession(msg);
+      setInputSession(msg, { action: 'STOCK', step: 'itemName', data: {} });
+      await answerCallbackQuery(callbackId, 'STOCK');
+      await sendMessage(chatId, buildSessionPrompt('STOCK', 'itemName'));
       return;
     }
 
@@ -3273,12 +3462,11 @@ async function handleCallbackQuery(callbackQuery) {
         await answerCallbackQuery(callbackId, 'You are not allowed', true);
         return;
       }
-      await answerCallbackQuery(callbackId, 'បញ្ចូលស្តុក bulk');
-      await sendForceReplyPrompt(
+      clearInputSession(msg);
+      await answerCallbackQuery(callbackId, 'IN BULK');
+      await sendMessage(
         chatId,
-        'សូម reply ជាបន្ទាត់ច្រើន:\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note',
-        'Paracetamol | 10 | received',
-        msg.message_id
+        '📥➕ IN BULK\n\nសូមផ្ញើជាបន្ទាត់ច្រើន:\n/inbulk\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note\n\nឬវាយផ្ទាល់ command ចាស់ក៏បាន។'
       );
       return;
     }
@@ -3288,27 +3476,11 @@ async function handleCallbackQuery(callbackQuery) {
         await answerCallbackQuery(callbackId, 'You are not allowed', true);
         return;
       }
-      await answerCallbackQuery(callbackId, 'ដកស្តុក bulk');
-      await sendForceReplyPrompt(
+      clearInputSession(msg);
+      await answerCallbackQuery(callbackId, 'OUT BULK');
+      await sendMessage(
         chatId,
-        'សូម reply ជាបន្ទាត់ច្រើន:\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note',
-        'Paracetamol | 3 | used',
-        msg.message_id
-      );
-      return;
-    }
-
-    if (quickAction === 'STOCK') {
-      if (!canUseCommand(role, '/stock')) {
-        await answerCallbackQuery(callbackId, 'You are not allowed', true);
-        return;
-      }
-      await answerCallbackQuery(callbackId, 'មើលស្តុក');
-      await sendForceReplyPrompt(
-        chatId,
-        'សូម reply តែឈ្មោះ Item:\nItem Name',
-        'Paracetamol',
-        msg.message_id
+        '📤➖ OUT BULK\n\nសូមផ្ញើជាបន្ទាត់ច្រើន:\n/outbulk\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note\n\nឬវាយផ្ទាល់ command ចាស់ក៏បាន។'
       );
       return;
     }
@@ -3318,11 +3490,9 @@ async function handleCallbackQuery(callbackQuery) {
         await answerCallbackQuery(callbackId, 'You are not allowed', true);
         return;
       }
+      clearInputSession(msg);
       await answerCallbackQuery(callbackId, 'Low stock');
-      await handleCommand({
-        ...msg,
-        text: '/lowstock'
-      });
+      await handleCommand({ ...msg, text: '/lowstock' });
       return;
     }
 
@@ -3331,11 +3501,9 @@ async function handleCallbackQuery(callbackQuery) {
         await answerCallbackQuery(callbackId, 'You are not allowed', true);
         return;
       }
+      clearInputSession(msg);
       await answerCallbackQuery(callbackId, 'All stock');
-      await handleCommand({
-        ...msg,
-        text: '/allstock'
-      });
+      await handleCommand({ ...msg, text: '/allstock' });
       return;
     }
 
@@ -3344,20 +3512,16 @@ async function handleCallbackQuery(callbackQuery) {
         await answerCallbackQuery(callbackId, 'You are not allowed', true);
         return;
       }
+      clearInputSession(msg);
       await answerCallbackQuery(callbackId, 'Dashboard');
-      await handleCommand({
-        ...msg,
-        text: '/dashboard'
-      });
+      await handleCommand({ ...msg, text: '/dashboard' });
       return;
     }
 
     if (quickAction === 'MENU') {
+      clearInputSession(msg);
       await answerCallbackQuery(callbackId, 'Menu');
-      await handleCommand({
-        ...msg,
-        text: '/menu'
-      });
+      await handleCommand({ ...msg, text: '/menu' });
       return;
     }
 
@@ -3417,6 +3581,15 @@ app.post('/webhook', async (req, res) => {
 
     if (!msg || !msg.text) return res.sendStatus(200);
 
+    const text = String(msg.text || '').trim();
+
+    if (!text.startsWith('/')) {
+      const consumedBySession = await processInputSessionMessage(msg);
+      if (consumedBySession) {
+        return res.sendStatus(200);
+      }
+    }
+
     await handleCommand(msg);
     return res.sendStatus(200);
   } catch (err) {
@@ -3434,11 +3607,21 @@ app.get('/webhook', (req, res) => {
 });
 
 /**************** BACKGROUND JOBS ****************/
+function pruneInputSessions() {
+  const now = Date.now();
+  for (const [key, session] of inputSessionCache) {
+    if (now - Number(session.updatedAt || 0) > INPUT_SESSION_TIMEOUT_MS) {
+      inputSessionCache.delete(key);
+    }
+  }
+}
+
 function startBackgroundJobs() {
   setInterval(() => {
     runNonCriticalTask('pruneProcessedMessageCache error:', async () => {
       pruneProcessedMessageCache();
       pruneRateLimitCache();
+      pruneInputSessions();
     });
   }, Math.max(60 * 1000, RATE_LIMIT_WINDOW_MS));
 
