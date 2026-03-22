@@ -1062,14 +1062,14 @@ async function handleCommand(msg) {
   try {
     /************ GROUP WHITELIST CHECK ************/
     if (isGroupChat(msg) && !GROUP_BYPASS_COMMANDS.has(command)) {
-    if (allowedChatRows.length === 0) {
+      if (allowedChatRows.length === 0) {
       return sendMessage(
         chatId,
         '⛔ This group is not allowed yet.\nSuper Admin must run /allowgroup in this group first.'
       );
     }
 
-    if (!isAllowedChatId(chatId, allowedChatRows)) {
+      if (!isAllowedChatId(chatId, allowedChatRows)) {
       return sendMessage(
         chatId,
         '⛔ This group is not in whitelist.\nPlease ask Super Admin to run /allowgroup here.'
@@ -1087,7 +1087,7 @@ async function handleCommand(msg) {
   }
 
   /*
-  /************ IDEMPOTENCY CHECK FOR WRITE COMMANDS ************/
+  Old duplicate idempotency block
   if (isWriteCommand && !processedMessageKey) {
       console.log(`ℹ️ Duplicate webhook ignored: message_id=${msg.message_id}, command=${command}`);
       return sendMessage(chatId, 'ℹ️ This command was already processed.');
@@ -1100,7 +1100,7 @@ async function handleCommand(msg) {
   if (isWriteCommand && !processedMessageKey) {
     console.log(`Duplicate webhook ignored: message_id=${msg.message_id}, command=${command}`);
     return sendMessage(chatId, 'This command was already processed.');
-  }
+    }
 
   /************ HELP / START ************/
   if (command === '/start' || command === '/help') {
