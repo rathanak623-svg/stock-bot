@@ -324,27 +324,46 @@ function buildPendingActionInlineKeyboard(code) {
   };
 }
 
-function buildQuickActionsInlineKeyboard() {
-  return {
-    inline_keyboard: [
-      [
-        { text: '📥 IN', callback_data: 'QA|IN' },
-        { text: '📤 OUT', callback_data: 'QA|OUT' }
-      ],
-      [
-        { text: '📥➕ IN BULK', callback_data: 'QA|INBULK' },
-        { text: '📤➖ OUT BULK', callback_data: 'QA|OUTBULK' }
-      ],
-      [
-        { text: '📊 STOCK', callback_data: 'QA|STOCK' },
-        { text: '🚨 LOW STOCK', callback_data: 'QA|LOWSTOCK' }
-      ],
-      [
-        { text: '📈 DASHBOARD', callback_data: 'QA|DASHBOARD' },
-        { text: '📋 MENU', callback_data: 'QA|MENU' }
-      ]
+function buildQuickActionsInlineKeyboard(role = 'guest') {
+  const rows = [
+    [
+      { text: '📥 IN', callback_data: 'QA|IN' },
+      { text: '📤 OUT', callback_data: 'QA|OUT' }
+    ],
+    [
+      { text: '📊 STOCK', callback_data: 'QA|STOCK' },
+      { text: '🚨 LOW STOCK', callback_data: 'QA|LOWSTOCK' }
+    ],
+    [
+      { text: '📈 DASHBOARD', callback_data: 'QA|DASHBOARD' },
+      { text: '📋 MENU', callback_data: 'QA|MENU' }
     ]
-  };
+  ];
+
+  if (role === 'super_admin' || role === 'admin') {
+    rows.unshift([
+      { text: '➕ ADD ITEM', callback_data: 'QA|ADDITEM' },
+      { text: '📥➕ IN BULK', callback_data: 'QA|INBULK' }
+    ]);
+    rows.splice(2, 0, [
+      { text: '📤➖ OUT BULK', callback_data: 'QA|OUTBULK' },
+      { text: '🗂 ALL STOCK', callback_data: 'QA|ALLSTOCK' }
+    ]);
+  } else if (role === 'member') {
+    rows.splice(1, 0, [
+      { text: '📥➕ IN BULK', callback_data: 'QA|INBULK' },
+      { text: '📤➖ OUT BULK', callback_data: 'QA|OUTBULK' }
+    ]);
+    rows.splice(3, 0, [
+      { text: '🗂 ALL STOCK', callback_data: 'QA|ALLSTOCK' }
+    ]);
+  } else {
+    rows.splice(1, 0, [
+      { text: '🗂 ALL STOCK', callback_data: 'QA|ALLSTOCK' }
+    ]);
+  }
+
+  return { inline_keyboard: rows };
 }
 
 function buildForceReply(inputPlaceholder = '') {
@@ -355,11 +374,11 @@ function buildForceReply(inputPlaceholder = '') {
   };
 }
 
-async function sendQuickActionsMenu(chatId) {
+async function sendQuickActionsMenu(chatId, role = 'guest') {
   await sendMessage(
     chatId,
     '⚡ Quick Actions',
-    { replyMarkup: buildQuickActionsInlineKeyboard() }
+    { replyMarkup: buildQuickActionsInlineKeyboard(role) }
   );
 }
 
@@ -430,6 +449,54 @@ function getCallbackFeedback(resultMessage, fallbackOk = 'Done') {
   }
 
   return { text: text.slice(0, 120) || fallbackOk, showAlert: false };
+}
+
+function detectQuickActionReply(msg) {
+  const replyText = clean(msg?.reply_to_message?.text || '');
+
+  if (!replyText) return null;
+
+  if (replyText.includes('/additem | Item Name | MinAlert | Unit')) return 'ADDITEM';
+  if (replyText.includes('/inbulk')) return 'INBULK';
+  if (replyText.includes('/outbulk')) return 'OUTBULK';
+  if (replyText.includes('/in | Item Name | Qty | Optional Note')) return 'IN';
+  if (replyText.includes('/out | Item Name | Qty | Optional Note')) return 'OUT';
+  if (replyText.includes('/stock | Item Name')) return 'STOCK';
+
+  return null;
+}
+
+function transformQuickReplyToCommand(msg) {
+  const action = detectQuickActionReply(msg);
+  if (!action) return null;
+
+  const raw = clean(msg.text || '');
+  if (!raw) return null;
+
+  if (raw.startsWith('/')) {
+    return raw;
+  }
+
+  if (action === 'ADDITEM') {
+    return `/additem | ${raw}`;
+  }
+  if (action === 'IN') {
+    return `/in | ${raw}`;
+  }
+  if (action === 'OUT') {
+    return `/out | ${raw}`;
+  }
+  if (action === 'STOCK') {
+    return `/stock | ${raw}`;
+  }
+  if (action === 'INBULK') {
+    return `/inbulk\n${String(msg.text || '').trim()}`;
+  }
+  if (action === 'OUTBULK') {
+    return `/outbulk\n${String(msg.text || '').trim()}`;
+  }
+
+  return null;
 }
 
 async function sendMessage(chatId, text, options = {}) {
@@ -1985,7 +2052,10 @@ async function cancelPendingActionByCode(code, actorCtx) {
 
 /**************** COMMAND HANDLER ****************/
 async function handleCommand(msg) {
-  const rawText = String(msg.text || '');
+  const transformedQuickReply = transformQuickReplyToCommand(msg);
+  const effectiveText = transformedQuickReply || String(msg.text || '');
+
+  const rawText = effectiveText;
   const lines = String(rawText).split(/\r?\n/).map(s => clean(s)).filter(Boolean);
   const headerLine = lines[0] || '';
   const parts = parsePipe(headerLine);
@@ -2109,7 +2179,7 @@ async function handleCommand(msg) {
           '/cancel | CODE'
         );
         await sendMessage(chatId, '📌 Daily menu is ready', { replyMarkup: replyKeyboard });
-        await sendQuickActionsMenu(chatId);
+        await sendQuickActionsMenu(chatId, role);
         return;
       }
 
@@ -2145,7 +2215,7 @@ async function handleCommand(msg) {
           '/cancel | CODE'
         );
         await sendMessage(chatId, '📌 Daily menu is ready', { replyMarkup: replyKeyboard });
-        await sendQuickActionsMenu(chatId);
+        await sendQuickActionsMenu(chatId, role);
         return;
       }
 
@@ -2171,7 +2241,7 @@ async function handleCommand(msg) {
           '/cancel | CODE'
         );
         await sendMessage(chatId, '📌 Daily menu is ready', { replyMarkup: replyKeyboard });
-        await sendQuickActionsMenu(chatId);
+        await sendQuickActionsMenu(chatId, role);
         return;
       }
 
@@ -2645,7 +2715,7 @@ async function handleCommand(msg) {
       if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
 
       await sendMessage(chatId, `📊 Stock Info\n\n${buildStockMessage(ref.row)}`, {
-        replyMarkup: buildQuickActionsInlineKeyboard()
+        replyMarkup: buildQuickActionsInlineKeyboard(role)
       });
       return;
     }
@@ -2654,7 +2724,7 @@ async function handleCommand(msg) {
       const data = await getData();
       if (data.length === 0) {
         return sendMessage(chatId, '📭 No stock data', {
-          replyMarkup: buildQuickActionsInlineKeyboard()
+          replyMarkup: buildQuickActionsInlineKeyboard(role)
         });
       }
 
@@ -2669,7 +2739,7 @@ async function handleCommand(msg) {
       }
 
       await sendLongMessage(chatId, msgOut, {
-        replyMarkup: buildQuickActionsInlineKeyboard()
+        replyMarkup: buildQuickActionsInlineKeyboard(role)
       });
       return;
     }
@@ -2678,14 +2748,14 @@ async function handleCommand(msg) {
       const data = await getData();
       if (data.length === 0) {
         return sendMessage(chatId, '📭 No stock data', {
-          replyMarkup: buildQuickActionsInlineKeyboard()
+          replyMarkup: buildQuickActionsInlineKeyboard(role)
         });
       }
 
       const lowItems = data.filter(r => getBalanceFromRow(r) <= toNumber(r[4]));
       if (lowItems.length === 0) {
         return sendMessage(chatId, '✅ No low stock items', {
-          replyMarkup: buildQuickActionsInlineKeyboard()
+          replyMarkup: buildQuickActionsInlineKeyboard(role)
         });
       }
 
@@ -2699,7 +2769,7 @@ async function handleCommand(msg) {
       }
 
       await sendLongMessage(chatId, msgOut, {
-        replyMarkup: buildQuickActionsInlineKeyboard()
+        replyMarkup: buildQuickActionsInlineKeyboard(role)
       });
       return;
     }
@@ -2934,7 +3004,7 @@ async function handleCommand(msg) {
         return sendMessage(
           chatId,
           `📭 No transactions today (${summary.today}, ${APP_TIMEZONE})`,
-          { replyMarkup: buildQuickActionsInlineKeyboard() }
+          { replyMarkup: buildQuickActionsInlineKeyboard(role) }
         );
       }
 
@@ -2949,7 +3019,7 @@ async function handleCommand(msg) {
         `🧾 Total Transactions: ${totalTx}`;
 
       await sendMessage(chatId, msgOut, {
-        replyMarkup: buildQuickActionsInlineKeyboard()
+        replyMarkup: buildQuickActionsInlineKeyboard(role)
       });
       return;
     }
@@ -3012,7 +3082,7 @@ async function handleCommand(msg) {
       }
 
       await sendLongMessage(chatId, msgOut, {
-        replyMarkup: buildQuickActionsInlineKeyboard()
+        replyMarkup: buildQuickActionsInlineKeyboard(role)
       });
       return;
     }
@@ -3133,69 +3203,121 @@ async function handleCallbackQuery(callbackQuery) {
     return;
   }
 
+  const actorCtx = getActorContext(msg);
+  const username = actorCtx.username;
+  const chatId = msg.chat.id;
+
+  const [roleRows, allowedChatRows] = await Promise.all([getRoles(), getAllowedChats()]);
+  const role = getUserRoleFromRows(username, roleRows);
+
   // QUICK ACTIONS
   if (data.startsWith('QA|')) {
     const quickAction = clean(data.split('|')[1] || '');
-    const chatId = msg.chat.id;
+
+    if (isGroupChat(msg)) {
+      if (allowedChatRows.length === 0 || !isAllowedChatId(chatId, allowedChatRows)) {
+        await answerCallbackQuery(callbackId, 'This group is not allowed', true);
+        return;
+      }
+    }
 
     await clearInlineKeyboardFromCallback(callbackQuery);
 
+    if (quickAction === 'ADDITEM') {
+      if (!(role === 'super_admin' || role === 'admin')) {
+        await answerCallbackQuery(callbackId, 'You are not allowed', true);
+        return;
+      }
+      await answerCallbackQuery(callbackId, 'Add item');
+      await sendForceReplyPrompt(
+        chatId,
+        'សូម reply តាម format ខាងក្រោម:\nItem Name | MinAlert | Unit',
+        'Paracetamol | 10 | box',
+        msg.message_id
+      );
+      return;
+    }
+
     if (quickAction === 'IN') {
+      if (!canUseCommand(role, '/in')) {
+        await answerCallbackQuery(callbackId, 'You are not allowed', true);
+        return;
+      }
       await answerCallbackQuery(callbackId, 'បញ្ចូលស្តុក');
       await sendForceReplyPrompt(
         chatId,
-        'សូម reply តាម format ខាងក្រោម:\n/in | Item Name | Qty | Optional Note',
-        '/in | Paracetamol | 10 | received',
+        'សូម reply តាម format ខាងក្រោម:\nItem Name | Qty | Optional Note',
+        'Paracetamol | 10 | received',
         msg.message_id
       );
       return;
     }
 
     if (quickAction === 'OUT') {
+      if (!canUseCommand(role, '/out')) {
+        await answerCallbackQuery(callbackId, 'You are not allowed', true);
+        return;
+      }
       await answerCallbackQuery(callbackId, 'ដកស្តុក');
       await sendForceReplyPrompt(
         chatId,
-        'សូម reply តាម format ខាងក្រោម:\n/out | Item Name | Qty | Optional Note',
-        '/out | Paracetamol | 5 | used',
+        'សូម reply តាម format ខាងក្រោម:\nItem Name | Qty | Optional Note',
+        'Paracetamol | 5 | used',
         msg.message_id
       );
       return;
     }
 
     if (quickAction === 'INBULK') {
+      if (!canUseCommand(role, '/inbulk')) {
+        await answerCallbackQuery(callbackId, 'You are not allowed', true);
+        return;
+      }
       await answerCallbackQuery(callbackId, 'បញ្ចូលស្តុក bulk');
       await sendForceReplyPrompt(
         chatId,
-        'សូម reply តាម format ខាងក្រោម:\n/inbulk\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note',
-        '/inbulk',
+        'សូម reply ជាបន្ទាត់ច្រើន:\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note',
+        'Paracetamol | 10 | received',
         msg.message_id
       );
       return;
     }
 
     if (quickAction === 'OUTBULK') {
+      if (!canUseCommand(role, '/outbulk')) {
+        await answerCallbackQuery(callbackId, 'You are not allowed', true);
+        return;
+      }
       await answerCallbackQuery(callbackId, 'ដកស្តុក bulk');
       await sendForceReplyPrompt(
         chatId,
-        'សូម reply តាម format ខាងក្រោម:\n/outbulk\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note',
-        '/outbulk',
+        'សូម reply ជាបន្ទាត់ច្រើន:\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note',
+        'Paracetamol | 3 | used',
         msg.message_id
       );
       return;
     }
 
     if (quickAction === 'STOCK') {
+      if (!canUseCommand(role, '/stock')) {
+        await answerCallbackQuery(callbackId, 'You are not allowed', true);
+        return;
+      }
       await answerCallbackQuery(callbackId, 'មើលស្តុក');
       await sendForceReplyPrompt(
         chatId,
-        'សូម reply តាម format ខាងក្រោម:\n/stock | Item Name',
-        '/stock | Paracetamol',
+        'សូម reply តែឈ្មោះ Item:\nItem Name',
+        'Paracetamol',
         msg.message_id
       );
       return;
     }
 
     if (quickAction === 'LOWSTOCK') {
+      if (!canUseCommand(role, '/lowstock')) {
+        await answerCallbackQuery(callbackId, 'You are not allowed', true);
+        return;
+      }
       await answerCallbackQuery(callbackId, 'Low stock');
       await handleCommand({
         ...msg,
@@ -3204,7 +3326,24 @@ async function handleCallbackQuery(callbackQuery) {
       return;
     }
 
+    if (quickAction === 'ALLSTOCK') {
+      if (!canUseCommand(role, '/allstock')) {
+        await answerCallbackQuery(callbackId, 'You are not allowed', true);
+        return;
+      }
+      await answerCallbackQuery(callbackId, 'All stock');
+      await handleCommand({
+        ...msg,
+        text: '/allstock'
+      });
+      return;
+    }
+
     if (quickAction === 'DASHBOARD') {
+      if (!canUseCommand(role, '/dashboard')) {
+        await answerCallbackQuery(callbackId, 'You are not allowed', true);
+        return;
+      }
       await answerCallbackQuery(callbackId, 'Dashboard');
       await handleCommand({
         ...msg,
@@ -3234,13 +3373,6 @@ async function handleCallbackQuery(callbackQuery) {
     await answerCallbackQuery(callbackId, 'Invalid action', true);
     return;
   }
-
-  const actorCtx = getActorContext(msg);
-  const username = actorCtx.username;
-  const chatId = msg.chat.id;
-
-  const [roleRows, allowedChatRows] = await Promise.all([getRoles(), getAllowedChats()]);
-  const role = getUserRoleFromRows(username, roleRows);
 
   if (isGroupChat(msg)) {
     if (allowedChatRows.length === 0 || !isAllowedChatId(chatId, allowedChatRows)) {
