@@ -48,7 +48,7 @@ const BOOTSTRAP_SUPER_ADMINS = (process.env.SUPER_ADMINS || '')
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 
-const GROUP_BYPASS_COMMANDS = new Set(['/allowgroup', '/start', '/help', '/myrole']);
+const GROUP_BYPASS_COMMANDS = new Set(['/allowgroup', '/start', '/help', '/myrole', '/menu']);
 const WRITE_COMMANDS = new Set([
   '/addsuperadmin', '/removesuperadmin',
   '/addadmin', '/removeadmin',
@@ -84,7 +84,6 @@ const processedMessageCache = new Map();
 const processedMessageInflight = new Set();
 const sheetIdCache = new Map();
 const rateLimitCache = new Map();
-const lastDailySummaryDateByChat = new Map();
 
 let spreadsheetMetaCache = {
   data: null,
@@ -95,7 +94,7 @@ let spreadsheetMetaCache = {
 /*
   Note:
   - Works for a single running instance.
-  - If you scale to multiple instances, move locking to external storage.
+  - If you scale to multiple instances, move locking/state to external storage.
 */
 const itemLocks = new Map();
 
@@ -104,21 +103,26 @@ async function withLock(key, fn) {
   const prev = itemLocks.get(safeKey) || Promise.resolve();
 
   let release;
-  const next = new Promise(resolve => {
+  const gate = new Promise(resolve => {
     release = resolve;
   });
 
-  itemLocks.set(safeKey, prev.then(() => next));
+  const current = prev.then(() => gate);
+  itemLocks.set(safeKey, current);
 
   try {
     await prev;
     return await fn();
   } finally {
     release();
-    if (itemLocks.get(safeKey) === next) {
+    if (itemLocks.get(safeKey) === current) {
       itemLocks.delete(safeKey);
     }
   }
+}
+
+async function withStockSheetWriteLock(fn) {
+  return withLock('sheet:stock:write', fn);
 }
 
 /**************** HELPERS ****************/
@@ -136,6 +140,10 @@ function clean(text) {
 
 function cleanUsername(text) {
   return clean(text).replace(/^@+/, '').toLowerCase();
+}
+
+function normalizeCommand(raw) {
+  return norm(raw).split('@')[0];
 }
 
 function logError(label, err) {
@@ -277,14 +285,183 @@ function parseQtyAndOptionalNote(parts) {
   return { qty, note };
 }
 
-async function sendMessage(chatId, text) {
+function getDailyReplyKeyboard(role) {
+  const common = [
+    [{ text: '/dashboard' }, { text: '/allstock' }],
+    [{ text: '/lowstock' }, { text: '/stock | ' }],
+    [{ text: '/in | ' }, { text: '/out | ' }]
+  ];
+
+  if (role === 'super_admin' || role === 'admin') {
+    common.push(
+      [{ text: '/inbulk' }, { text: '/outbulk' }],
+      [{ text: '/additem | ' }, { text: '/undo | ' }],
+      [{ text: '/today' }, { text: '/exportsummary' }]
+    );
+  } else if (role === 'member') {
+    common.push(
+      [{ text: '/inbulk' }, { text: '/outbulk' }],
+      [{ text: '/today' }, { text: '/menu' }]
+    );
+  } else {
+    common.push([{ text: '/help' }]);
+  }
+
+  return {
+    keyboard: common,
+    resize_keyboard: true,
+    persistent: true,
+    input_field_placeholder: 'ជ្រើស command ឬវាយ command...'
+  };
+}
+
+function buildPendingActionInlineKeyboard(code) {
+  return {
+    inline_keyboard: [[
+      { text: '✅ Confirm', callback_data: `CONFIRM|${code}` },
+      { text: '❌ Cancel', callback_data: `CANCEL|${code}` }
+    ]]
+  };
+}
+
+function buildQuickActionsInlineKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '📥 IN', callback_data: 'QA|IN' },
+        { text: '📤 OUT', callback_data: 'QA|OUT' }
+      ],
+      [
+        { text: '📥➕ IN BULK', callback_data: 'QA|INBULK' },
+        { text: '📤➖ OUT BULK', callback_data: 'QA|OUTBULK' }
+      ],
+      [
+        { text: '📊 STOCK', callback_data: 'QA|STOCK' },
+        { text: '🚨 LOW STOCK', callback_data: 'QA|LOWSTOCK' }
+      ],
+      [
+        { text: '📈 DASHBOARD', callback_data: 'QA|DASHBOARD' },
+        { text: '📋 MENU', callback_data: 'QA|MENU' }
+      ]
+    ]
+  };
+}
+
+function buildForceReply(inputPlaceholder = '') {
+  return {
+    force_reply: true,
+    selective: true,
+    input_field_placeholder: inputPlaceholder
+  };
+}
+
+async function sendQuickActionsMenu(chatId) {
+  await sendMessage(
+    chatId,
+    '⚡ Quick Actions',
+    { replyMarkup: buildQuickActionsInlineKeyboard() }
+  );
+}
+
+async function sendForceReplyPrompt(chatId, text, inputPlaceholder = '', replyToMessageId = null) {
+  await sendMessage(chatId, text, {
+    replyMarkup: buildForceReply(inputPlaceholder),
+    replyToMessageId
+  });
+}
+
+async function editMessageReplyMarkup(chatId, messageId, replyMarkup = null) {
   try {
-    await telegramHttp.post('/sendMessage', {
+    const payload = {
+      chat_id: chatId,
+      message_id: messageId
+    };
+
+    if (replyMarkup !== null) {
+      payload.reply_markup = replyMarkup;
+    }
+
+    await telegramHttp.post('/editMessageReplyMarkup', payload);
+  } catch (err) {
+    logError('Telegram editMessageReplyMarkup error:', err);
+  }
+}
+
+async function clearInlineKeyboardFromCallback(callbackQuery) {
+  const chatId = callbackQuery?.message?.chat?.id;
+  const messageId = callbackQuery?.message?.message_id;
+  if (!chatId || !messageId) return;
+
+  await editMessageReplyMarkup(chatId, messageId, { inline_keyboard: [] });
+}
+
+function buildCallbackMsgLike(callbackQuery) {
+  return {
+    message_id: callbackQuery?.message?.message_id,
+    from: callbackQuery?.from,
+    chat: callbackQuery?.message?.chat,
+    text: callbackQuery?.message?.text || ''
+  };
+}
+
+function getCallbackFeedback(resultMessage, fallbackOk = 'Done') {
+  const text = clean(resultMessage || '');
+
+  if (
+    text.startsWith('Confirmed') ||
+    text.startsWith('Cancelled') ||
+    text.startsWith('🗑️') ||
+    text.startsWith('🛠') ||
+    text.startsWith('✅')
+  ) {
+    return { text: fallbackOk, showAlert: false };
+  }
+
+  if (
+    text.includes('not allowed') ||
+    text.includes('not yours') ||
+    text.includes('expired') ||
+    text.includes('failed') ||
+    text.includes('invalid') ||
+    text.includes('another chat') ||
+    text.includes('already')
+  ) {
+    return { text: text.slice(0, 180) || 'Action failed', showAlert: true };
+  }
+
+  return { text: text.slice(0, 120) || fallbackOk, showAlert: false };
+}
+
+async function sendMessage(chatId, text, options = {}) {
+  try {
+    const payload = {
       chat_id: chatId,
       text
-    });
+    };
+
+    if (options.replyMarkup) {
+      payload.reply_markup = options.replyMarkup;
+    }
+
+    if (options.replyToMessageId) {
+      payload.reply_to_message_id = options.replyToMessageId;
+    }
+
+    await telegramHttp.post('/sendMessage', payload);
   } catch (err) {
     logError('Telegram sendMessage error:', err);
+  }
+}
+
+async function answerCallbackQuery(callbackQueryId, text, showAlert = false) {
+  try {
+    await telegramHttp.post('/answerCallbackQuery', {
+      callback_query_id: callbackQueryId,
+      text,
+      show_alert: showAlert
+    });
+  } catch (err) {
+    logError('Telegram answerCallbackQuery error:', err);
   }
 }
 
@@ -324,10 +501,16 @@ function chunkMessage(text, maxLen = 3500) {
   return chunks;
 }
 
-async function sendLongMessage(chatId, text) {
+async function sendLongMessage(chatId, text, options = {}) {
   const chunks = chunkMessage(text);
-  for (const chunk of chunks) {
-    await sendMessage(chatId, chunk);
+
+  for (let i = 0; i < chunks.length; i++) {
+    const isLast = i === chunks.length - 1;
+
+    await sendMessage(chatId, chunks[i], {
+      replyMarkup: isLast ? options.replyMarkup : undefined,
+      replyToMessageId: isLast ? options.replyToMessageId : undefined
+    });
   }
 }
 
@@ -492,15 +675,6 @@ async function acquireWriteCommandGuard(messageId, chatId) {
   }
 }
 
-function validatePendingActionOwnership(pending, username, chatId) {
-  if (!pending) return 'Confirmation code not found';
-  if (pending.status !== 'pending') return `This request is already ${pending.status}`;
-  if (pending.username !== username) return 'This confirmation code is not yours';
-  if (pending.chatId !== String(chatId)) return 'This confirmation code belongs to another chat';
-  if (isExpired(pending.expiresAt)) return 'expired';
-  return null;
-}
-
 function isRateLimited(actorCtx, role, command) {
   if (!WRITE_COMMANDS.has(command)) return false;
   if (role === 'super_admin') return false;
@@ -561,9 +735,9 @@ const SHEET_HEADERS = {
   Reports: ['Timestamp', 'Type', 'Details'],
   Roles: ['Username', 'Role', 'UpdatedAt'],
   AllowedChats: ['ChatId', 'ChatTitle', 'ChatType', 'AddedAt'],
-  PendingActions: ['Code', 'Username', 'ChatId', 'Action', 'PayloadJson', 'Status', 'CreatedAt', 'ExpiresAt'],
+  PendingActions: ['Code', 'Username', 'UserId', 'ChatId', 'Action', 'PayloadJson', 'Status', 'CreatedAt', 'ExpiresAt'],
   ProcessedMessages: ['MessageId', 'ChatId', 'Command', 'ProcessedAt'],
-  GroupSettings: ['ChatId', 'ChatTitle', 'DailyReportEnabled', 'LowStockAlertsEnabled', 'UpdatedAt']
+  GroupSettings: ['ChatId', 'ChatTitle', 'DailyReportEnabled', 'LowStockAlertsEnabled', 'LastDailyReportDate', 'UpdatedAt']
 };
 
 const SHEET_RANGES = {
@@ -571,9 +745,9 @@ const SHEET_RANGES = {
   Logs: "'Logs'!A2:L",
   Roles: "'Roles'!A2:C",
   AllowedChats: "'AllowedChats'!A2:D",
-  PendingActions: "'PendingActions'!A2:H",
+  PendingActions: "'PendingActions'!A2:I",
   ProcessedMessages: "'ProcessedMessages'!A2:D",
-  GroupSettings: "'GroupSettings'!A2:E"
+  GroupSettings: "'GroupSettings'!A2:F"
 };
 
 const SHEET_CACHE_KEYS = {
@@ -699,17 +873,22 @@ async function ensureHeader(title, headers) {
     range
   });
 
-  const current = headerRes.data.values || [];
-  if (current.length === 0) {
+  const current = headerRes.data.values?.[0] || [];
+  const expected = headers;
+  const isSame =
+    current.length === expected.length &&
+    current.every((v, i) => String(v || '') === String(expected[i] || ''));
+
+  if (!isSame) {
     await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
       range,
       valueInputOption: 'RAW',
       requestBody: { values: [headers] }
     });
-    console.log(`✅ Header created: ${title}`);
+    console.log(`✅ Header synced: ${title}`);
   } else {
-    console.log(`ℹ️ Header already exists: ${title}`);
+    console.log(`ℹ️ Header already correct: ${title}`);
   }
 }
 
@@ -878,12 +1057,14 @@ async function deleteRowsFromSheet(sheetTitle, rowIndexesZeroBasedWithoutHeader)
 async function getGroupSetting(chatId) {
   const rows = await getGroupSettingsRows();
   const found = rows.find(r => String(r[0] || '') === String(chatId));
+
   if (!found) {
     return {
       chatId: String(chatId),
       chatTitle: '',
       dailyReportEnabled: true,
       lowStockAlertsEnabled: true,
+      lastDailyReportDate: '',
       updatedAt: ''
     };
   }
@@ -893,13 +1074,15 @@ async function getGroupSetting(chatId) {
     chatTitle: clean(found[1] || ''),
     dailyReportEnabled: norm(found[2]) !== 'false',
     lowStockAlertsEnabled: norm(found[3]) !== 'false',
-    updatedAt: clean(found[4] || '')
+    lastDailyReportDate: clean(found[4] || ''),
+    updatedAt: clean(found[5] || '')
   };
 }
 
 async function upsertGroupSetting(chatId, chatTitle, partial) {
   const rows = await getGroupSettingsRows();
   let idx = -1;
+
   for (let i = 0; i < rows.length; i++) {
     if (String(rows[i][0] || '') === String(chatId)) {
       idx = i;
@@ -908,10 +1091,16 @@ async function upsertGroupSetting(chatId, chatTitle, partial) {
   }
 
   const current = idx === -1
-    ? { dailyReportEnabled: true, lowStockAlertsEnabled: true, chatTitle: clean(chatTitle) }
+    ? {
+        dailyReportEnabled: true,
+        lowStockAlertsEnabled: true,
+        lastDailyReportDate: '',
+        chatTitle: clean(chatTitle)
+      }
     : {
         dailyReportEnabled: norm(rows[idx][2]) !== 'false',
         lowStockAlertsEnabled: norm(rows[idx][3]) !== 'false',
+        lastDailyReportDate: clean(rows[idx][4] || ''),
         chatTitle: clean(rows[idx][1] || chatTitle)
       };
 
@@ -920,26 +1109,33 @@ async function upsertGroupSetting(chatId, chatTitle, partial) {
     clean(chatTitle || current.chatTitle),
     String(partial.dailyReportEnabled ?? current.dailyReportEnabled),
     String(partial.lowStockAlertsEnabled ?? current.lowStockAlertsEnabled),
+    clean(partial.lastDailyReportDate ?? current.lastDailyReportDate),
     nowIso()
   ];
 
   if (idx === -1) {
     await sheets.spreadsheets.values.append({
       spreadsheetId: SPREADSHEET_ID,
-      range: "'GroupSettings'!A:E",
+      range: "'GroupSettings'!A:F",
       valueInputOption: 'RAW',
       requestBody: { values: [values] }
     });
   } else {
     await sheets.spreadsheets.values.update({
       spreadsheetId: SPREADSHEET_ID,
-      range: `'GroupSettings'!A${idx + 2}:E${idx + 2}`,
+      range: `'GroupSettings'!A${idx + 2}:F${idx + 2}`,
       valueInputOption: 'RAW',
       requestBody: { values: [values] }
     });
   }
 
   invalidateSheetCache('GroupSettings');
+}
+
+async function markDailyReportSent(chatId, chatTitle, dateString) {
+  await upsertGroupSetting(chatId, chatTitle, {
+    lastDailyReportDate: dateString
+  });
 }
 
 /**************** ROLES ****************/
@@ -1044,19 +1240,20 @@ async function removeAllowedChat(chatId) {
 }
 
 /**************** PENDING ACTIONS ****************/
-async function createPendingAction(username, chatId, action, payload) {
+async function createPendingAction(username, userId, chatId, action, payload) {
   const code = makeConfirmCode();
   const createdAt = nowIso();
   const expiresAt = minutesFromNowIso(CONFIRM_EXPIRE_MINUTES);
 
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
-    range: "'PendingActions'!A:H",
+    range: "'PendingActions'!A:I",
     valueInputOption: 'RAW',
     requestBody: {
       values: [[
         code,
         cleanUsername(username),
+        String(userId || ''),
         String(chatId),
         action,
         JSON.stringify(payload),
@@ -1079,12 +1276,13 @@ async function findPendingActionByCode(code) {
         rowIndex: i,
         code: clean(rows[i][0]),
         username: cleanUsername(rows[i][1]),
-        chatId: String(rows[i][2] || ''),
-        action: clean(rows[i][3]),
-        payloadJson: clean(rows[i][4]),
-        status: clean(rows[i][5]),
-        createdAt: clean(rows[i][6]),
-        expiresAt: clean(rows[i][7])
+        userId: String(rows[i][2] || ''),
+        chatId: String(rows[i][3] || ''),
+        action: clean(rows[i][4]),
+        payloadJson: clean(rows[i][5]),
+        status: clean(rows[i][6]),
+        createdAt: clean(rows[i][7]),
+        expiresAt: clean(rows[i][8])
       };
     }
   }
@@ -1101,27 +1299,45 @@ async function updatePendingActionStatus(rowIndex, status) {
     clean(row[0]),
     cleanUsername(row[1]),
     String(row[2] || ''),
-    clean(row[3]),
+    String(row[3] || ''),
     clean(row[4]),
+    clean(row[5]),
     status,
-    clean(row[6]),
-    clean(row[7])
+    clean(row[7]),
+    clean(row[8])
   ];
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
-    range: `'PendingActions'!A${rowIndex + 2}:H${rowIndex + 2}`,
+    range: `'PendingActions'!A${rowIndex + 2}:I${rowIndex + 2}`,
     valueInputOption: 'RAW',
     requestBody: { values: [newValues] }
   });
+}
+
+function validatePendingActionOwnership(pending, username, userId, chatId) {
+  if (!pending) return 'Confirmation code not found';
+  if (pending.status !== 'pending') return `This request is already ${pending.status}`;
+
+  if (pending.userId) {
+    if (String(pending.userId) !== String(userId || '')) {
+      return 'This confirmation code is not yours';
+    }
+  } else if (pending.username !== cleanUsername(username)) {
+    return 'This confirmation code is not yours';
+  }
+
+  if (pending.chatId !== String(chatId)) return 'This confirmation code belongs to another chat';
+  if (isExpired(pending.expiresAt)) return 'expired';
+  return null;
 }
 
 async function cleanupExpiredPendingActions() {
   const rows = await getPendingActions();
 
   for (let i = 0; i < rows.length; i++) {
-    const status = clean(rows[i][5]);
-    const expiresAt = clean(rows[i][7]);
+    const status = clean(rows[i][6]);
+    const expiresAt = clean(rows[i][8]);
 
     if (status === 'pending' && isExpired(expiresAt)) {
       await runNonCriticalTask('cleanupExpiredPendingActions error:', async () => {
@@ -1137,8 +1353,8 @@ async function cleanupOldPendingActions(days = PENDING_ACTION_RETENTION_DAYS) {
   const deleteIndexes = [];
 
   for (let i = 0; i < rows.length; i++) {
-    const status = clean(rows[i][5]);
-    const createdAt = clean(rows[i][6]);
+    const status = clean(rows[i][6]);
+    const createdAt = clean(rows[i][7]);
     const t = new Date(createdAt).getTime();
     if (Number.isNaN(t)) continue;
 
@@ -1193,7 +1409,7 @@ async function autoCleanupSheets() {
 /**************** PERMISSIONS ****************/
 const ROLE_COMMANDS = {
   super_admin: new Set([
-    '/start', '/help', '/myrole', '/roles', '/groups',
+    '/start', '/help', '/menu', '/myrole', '/roles', '/groups',
     '/addsuperadmin', '/removesuperadmin',
     '/addadmin', '/removeadmin',
     '/addmember', '/removemember',
@@ -1209,20 +1425,23 @@ const ROLE_COMMANDS = {
     '/additemsbulk', '/inbulk', '/outbulk'
   ]),
   admin: new Set([
-    '/start', '/help', '/myrole',
+    '/start', '/help', '/menu', '/myrole',
     '/additem', '/deleteitem', '/exportsummary',
     '/in', '/out', '/stock', '/allstock', '/alertstock', '/lowstock',
     '/search', '/exportlogs', '/confirm', '/cancel',
     '/undo', '/dashboard', '/itemlogs',
     '/health', '/stats',
     '/setdailyreport', '/setalerts',
-    '/additemsbulk', '/inbulk', '/outbulk'
+    '/additemsbulk', '/inbulk', '/outbulk',
+    '/today'
   ]),
   member: new Set([
-    '/start', '/help', '/myrole',
-    '/in', '/out', '/stock', '/allstock', '/alertstock', '/lowstock',
+    '/start', '/help', '/menu', '/myrole',
+    '/in', '/out', '/inbulk', '/outbulk',
+    '/stock', '/allstock', '/alertstock', '/lowstock',
     '/search', '/confirm', '/cancel',
-    '/dashboard', '/itemlogs'
+    '/dashboard', '/itemlogs',
+    '/today'
   ])
 };
 
@@ -1339,18 +1558,20 @@ async function executeConfirmedAction(pending, msg, role, actorCtx) {
   if (pending.action === 'deleteitem') {
     const itemName = clean(payload.itemName);
 
-    return await withLock(`stock:${itemName}`, async () => {
-      const data = await getData();
-      const row = findRowIndex(data, itemName);
-      if (row === -1) {
-        throw new Error(`Item not found: ${itemName}`);
-      }
+    return await withStockSheetWriteLock(async () => {
+      return await withLock(`stock:${itemName}`, async () => {
+        const data = await getData();
+        const row = findRowIndex(data, itemName);
+        if (row === -1) {
+          throw new Error(`Item not found: ${itemName}`);
+        }
 
-      await deleteRowFromSheet('Stock', row);
-      await runNonCriticalTask('Append report error:', () =>
-        appendReport('DELETE_ITEM', `By=${actorCtx.actor}, Deleted item=${itemName}`)
-      );
-      return `🗑️ Deleted Item: ${itemName}`;
+        await deleteRowFromSheet('Stock', row);
+        await runNonCriticalTask('Append report error:', () =>
+          appendReport('DELETE_ITEM', `By=${actorCtx.actor}, Deleted item=${itemName}`)
+        );
+        return `🗑️ Deleted Item: ${itemName}`;
+      });
     });
   }
 
@@ -1362,47 +1583,49 @@ async function executeConfirmedAction(pending, msg, role, actorCtx) {
       throw new Error('Invalid NewBalance');
     }
 
-    return await withLock(`stock:${itemName}`, async () => {
-      const data = await getData();
-      const row = findRowIndex(data, itemName);
-      if (row === -1) {
-        throw new Error(`Item not found: ${itemName}`);
-      }
+    return await withStockSheetWriteLock(async () => {
+      return await withLock(`stock:${itemName}`, async () => {
+        const data = await getData();
+        const row = findRowIndex(data, itemName);
+        if (row === -1) {
+          throw new Error(`Item not found: ${itemName}`);
+        }
 
-      const r = data[row];
-      const currentIn = toNumber(r[1]);
-      const minAlert = toNumber(r[4]);
-      const unit = clean(r[5] || '');
-      const oldBalance = getBalanceFromRow(r);
+        const r = data[row];
+        const currentIn = toNumber(r[1]);
+        const minAlert = toNumber(r[4]);
+        const unit = clean(r[5] || '');
+        const oldBalance = getBalanceFromRow(r);
 
-      if (newBalance > currentIn) {
-        throw new Error(`NewBalance cannot be greater than total In (${currentIn})`);
-      }
+        if (newBalance > currentIn) {
+          throw new Error(`NewBalance cannot be greater than total In (${currentIn})`);
+        }
 
-      const newOut = currentIn - newBalance;
-      const updated = [r[0], currentIn, newOut, newBalance, minAlert, unit, nowIso()];
-      await updateRow(row, updated);
+        const newOut = currentIn - newBalance;
+        const updated = [r[0], currentIn, newOut, newBalance, minAlert, unit, nowIso()];
+        await updateRow(row, updated);
 
-      await Promise.all([
-        runNonCriticalTask('Append log error:', () =>
-          appendLog([
-            nowIso(), 'ADJUST', r[0], 0, oldBalance, newBalance, unit,
-            actorCtx.chatId, actorCtx.chatTitle, actorCtx.actor, role, `Adjust balance to ${newBalance}`
-          ])
-        ),
-        runNonCriticalTask('Append report error:', () =>
-          appendReport('ADJUST', `By=${actorCtx.actor}, Item=${r[0]}, Before=${oldBalance}, After=${newBalance}`)
-        )
-      ]);
+        await Promise.all([
+          runNonCriticalTask('Append log error:', () =>
+            appendLog([
+              nowIso(), 'ADJUST', r[0], 0, oldBalance, newBalance, unit,
+              actorCtx.chatId, actorCtx.chatTitle, actorCtx.actor, role, `Adjust balance to ${newBalance}`
+            ])
+          ),
+          runNonCriticalTask('Append report error:', () =>
+            appendReport('ADJUST', `By=${actorCtx.actor}, Item=${r[0]}, Before=${oldBalance}, After=${newBalance}`)
+          )
+        ]);
 
-      await checkAndSendLowStockAlert(actorCtx.chatId, updated);
+        await checkAndSendLowStockAlert(actorCtx.chatId, updated);
 
-      return (
-        `🛠 Balance Adjusted\n\n` +
-        `💊 Item: ${r[0]}\n` +
-        `📦 Old Balance: ${oldBalance} ${unit}\n` +
-        `✅ New Balance: ${newBalance} ${unit}`
-      );
+        return (
+          `🛠 Balance Adjusted\n\n` +
+          `💊 Item: ${r[0]}\n` +
+          `📦 Old Balance: ${oldBalance} ${unit}\n` +
+          `✅ New Balance: ${newBalance} ${unit}`
+        );
+      });
     });
   }
 
@@ -1422,84 +1645,86 @@ async function getLastUndoableLogForItem(itemName) {
 }
 
 async function undoLastAction(itemName, actorCtx, role) {
-  return await withLock(`stock:${itemName}`, async () => {
-    const stockRef = await getStockRowByItemName(itemName);
-    if (!stockRef) {
-      throw new Error(`Item not found: ${itemName}`);
-    }
-
-    const lastLog = await getLastUndoableLogForItem(itemName);
-    if (!lastLog) {
-      throw new Error(`No undoable IN/OUT history found for: ${itemName}`);
-    }
-
-    const actionTs = new Date(clean(lastLog.row[0] || '')).getTime();
-    if (Number.isNaN(actionTs)) {
-      throw new Error('Last log timestamp is invalid');
-    }
-
-    if (Date.now() - actionTs > UNDO_WINDOW_MINUTES * 60 * 1000) {
-      throw new Error(`Undo window expired. Allowed within ${UNDO_WINDOW_MINUTES} minutes`);
-    }
-
-    const r = stockRef.row;
-    const currentIn = toNumber(r[1]);
-    const currentOut = toNumber(r[2]);
-    const currentBalance = getBalanceFromRow(r);
-    const minAlert = toNumber(r[4]);
-    const unit = clean(r[5] || '');
-
-    const logType = clean(lastLog.row[1] || '');
-    const qty = toNumber(lastLog.row[3]);
-
-    let newIn = currentIn;
-    let newOut = currentOut;
-    let note = '';
-
-    if (logType === 'IN') {
-      if (qty > currentIn) {
-        throw new Error('Cannot undo last IN because current total In is less than logged Qty');
+  return await withStockSheetWriteLock(async () => {
+    return await withLock(`stock:${itemName}`, async () => {
+      const stockRef = await getStockRowByItemName(itemName);
+      if (!stockRef) {
+        throw new Error(`Item not found: ${itemName}`);
       }
-      newIn = currentIn - qty;
-      if (newIn < currentOut) {
-        throw new Error('Cannot undo last IN because resulting balance would be negative');
+
+      const lastLog = await getLastUndoableLogForItem(itemName);
+      if (!lastLog) {
+        throw new Error(`No undoable IN/OUT history found for: ${itemName}`);
       }
-      note = `Undo last IN of ${qty}`;
-    } else if (logType === 'OUT') {
-      if (qty > currentOut) {
-        throw new Error('Cannot undo last OUT because current total Out is less than logged Qty');
+
+      const actionTs = new Date(clean(lastLog.row[0] || '')).getTime();
+      if (Number.isNaN(actionTs)) {
+        throw new Error('Last log timestamp is invalid');
       }
-      newOut = currentOut - qty;
-      note = `Undo last OUT of ${qty}`;
-    } else {
-      throw new Error('Last action is not undoable');
-    }
 
-    const newBalance = newIn - newOut;
-    const updated = [r[0], newIn, newOut, newBalance, minAlert, unit, nowIso()];
-    await updateRow(stockRef.rowIndex, updated);
+      if (Date.now() - actionTs > UNDO_WINDOW_MINUTES * 60 * 1000) {
+        throw new Error(`Undo window expired. Allowed within ${UNDO_WINDOW_MINUTES} minutes`);
+      }
 
-    await Promise.all([
-      runNonCriticalTask('Append log error:', () =>
-        appendLog([
-          nowIso(), 'UNDO', r[0], qty, currentBalance, newBalance, unit,
-          actorCtx.chatId, actorCtx.chatTitle, actorCtx.actor, role, note
-        ])
-      ),
-      runNonCriticalTask('Append report error:', () =>
-        appendReport('UNDO', `By=${actorCtx.actor}, Item=${r[0]}, ${note}, Before=${currentBalance}, After=${newBalance}`)
-      )
-    ]);
+      const r = stockRef.row;
+      const currentIn = toNumber(r[1]);
+      const currentOut = toNumber(r[2]);
+      const currentBalance = getBalanceFromRow(r);
+      const minAlert = toNumber(r[4]);
+      const unit = clean(r[5] || '');
 
-    await checkAndSendLowStockAlert(actorCtx.chatId, updated);
+      const logType = clean(lastLog.row[1] || '');
+      const qty = toNumber(lastLog.row[3]);
 
-    return (
-      `↩️ Undo Success\n\n` +
-      `💊 Item: ${r[0]}\n` +
-      `📝 Action: ${note}\n` +
-      `📦 Old Balance: ${currentBalance} ${unit}\n` +
-      `✅ New Balance: ${newBalance} ${unit}`
-    );
+      let newIn = currentIn;
+      let newOut = currentOut;
+      let note = '';
+
+      if (logType === 'IN') {
+        if (qty > currentIn) {
+          throw new Error('Cannot undo last IN because current total In is less than logged Qty');
+        }
+        newIn = currentIn - qty;
+        if (newIn < currentOut) {
+          throw new Error('Cannot undo last IN because resulting balance would be negative');
+        }
+        note = `Undo last IN of ${qty}`;
+      } else if (logType === 'OUT') {
+        if (qty > currentOut) {
+          throw new Error('Cannot undo last OUT because current total Out is less than logged Qty');
+        }
+        newOut = currentOut - qty;
+        note = `Undo last OUT of ${qty}`;
+      } else {
+        throw new Error('Last action is not undoable');
+      }
+
+      const newBalance = newIn - newOut;
+      const updated = [r[0], newIn, newOut, newBalance, minAlert, unit, nowIso()];
+      await updateRow(stockRef.rowIndex, updated);
+
+      await Promise.all([
+        runNonCriticalTask('Append log error:', () =>
+          appendLog([
+            nowIso(), 'UNDO', r[0], qty, currentBalance, newBalance, unit,
+            actorCtx.chatId, actorCtx.chatTitle, actorCtx.actor, role, note
+          ])
+        ),
+        runNonCriticalTask('Append report error:', () =>
+          appendReport('UNDO', `By=${actorCtx.actor}, Item=${r[0]}, ${note}, Before=${currentBalance}, After=${newBalance}`)
+        )
+      ]);
+
+      await checkAndSendLowStockAlert(actorCtx.chatId, updated);
+
+      return (
+        `↩️ Undo Success\n\n` +
+        `💊 Item: ${r[0]}\n` +
+        `📝 Action: ${note}\n` +
+        `📦 Old Balance: ${currentBalance} ${unit}\n` +
+        `✅ New Balance: ${newBalance} ${unit}`
+      );
+    });
   });
 }
 
@@ -1530,18 +1755,20 @@ async function processBulkAddItems(entries, actorCtx, role) {
       continue;
     }
 
-    const result = await withLock(`stock:${itemName}`, async () => {
-      const data = await getData();
-      const existing = findRowIndex(data, itemName);
-      if (existing !== -1) {
-        return `⚠️ Already exists: ${itemName}`;
-      }
+    const result = await withStockSheetWriteLock(async () => {
+      return await withLock(`stock:${itemName}`, async () => {
+        const data = await getData();
+        const existing = findRowIndex(data, itemName);
+        if (existing !== -1) {
+          return `⚠️ Already exists: ${itemName}`;
+        }
 
-      await appendRow([itemName, 0, 0, 0, minAlert, unit, nowIso()]);
-      await runNonCriticalTask('Append report error:', () =>
-        appendReport('ADD_ITEM_BULK', `By=${actorCtx.actor}, Item=${itemName}, MinAlert=${minAlert}, Unit=${unit}`)
-      );
-      return `✅ Added: ${itemName}`;
+        await appendRow([itemName, 0, 0, 0, minAlert, unit, nowIso()]);
+        await runNonCriticalTask('Append report error:', () =>
+          appendReport('ADD_ITEM_BULK', `By=${actorCtx.actor}, Item=${itemName}, MinAlert=${minAlert}, Unit=${unit}`)
+        );
+        return `✅ Added: ${itemName}`;
+      });
     });
 
     results.push(result);
@@ -1573,52 +1800,54 @@ async function processBulkMovement(entries, mode, actorCtx, role) {
       continue;
     }
 
-    const result = await withLock(`stock:${itemName}`, async () => {
-      const ref = await getStockRowByItemName(itemName);
-      if (!ref) return `❌ Item not found: ${itemName}`;
+    const result = await withStockSheetWriteLock(async () => {
+      return await withLock(`stock:${itemName}`, async () => {
+        const ref = await getStockRowByItemName(itemName);
+        if (!ref) return `❌ Item not found: ${itemName}`;
 
-      const r = ref.row;
-      const currentIn = toNumber(r[1]);
-      const currentOut = toNumber(r[2]);
-      const minAlert = toNumber(r[4]);
-      const unit = clean(r[5] || '');
-      const oldBalance = getBalanceFromRow(r);
+        const r = ref.row;
+        const currentIn = toNumber(r[1]);
+        const currentOut = toNumber(r[2]);
+        const minAlert = toNumber(r[4]);
+        const unit = clean(r[5] || '');
+        const oldBalance = getBalanceFromRow(r);
 
-      let updated;
-      let newBalance;
+        let updated;
+        let newBalance;
 
-      if (mode === 'IN') {
-        const newIn = currentIn + qty;
-        newBalance = newIn - currentOut;
-        updated = [r[0], newIn, currentOut, newBalance, minAlert, unit, nowIso()];
-      } else {
-        if (qty > oldBalance) {
-          return `❌ Not enough stock: ${itemName} (Balance ${oldBalance} ${unit})`;
+        if (mode === 'IN') {
+          const newIn = currentIn + qty;
+          newBalance = newIn - currentOut;
+          updated = [r[0], newIn, currentOut, newBalance, minAlert, unit, nowIso()];
+        } else {
+          if (qty > oldBalance) {
+            return `❌ Not enough stock: ${itemName} (Balance ${oldBalance} ${unit})`;
+          }
+          const newOut = currentOut + qty;
+          newBalance = currentIn - newOut;
+          updated = [r[0], currentIn, newOut, newBalance, minAlert, unit, nowIso()];
         }
-        const newOut = currentOut + qty;
-        newBalance = currentIn - newOut;
-        updated = [r[0], currentIn, newOut, newBalance, minAlert, unit, nowIso()];
-      }
 
-      await updateRow(ref.rowIndex, updated);
+        await updateRow(ref.rowIndex, updated);
 
-      await Promise.all([
-        runNonCriticalTask('Append log error:', () =>
-          appendLog([
-            nowIso(), mode, r[0], qty, oldBalance, newBalance, unit,
-            actorCtx.chatId, actorCtx.chatTitle, actorCtx.actor, role, note
-          ])
-        ),
-        runNonCriticalTask('Append report error:', () =>
-          appendReport(`${mode}_BULK`, `By=${actorCtx.actor}, Item=${r[0]}, Qty=${qty}, Before=${oldBalance}, After=${newBalance}, Note=${note}`)
-        )
-      ]);
+        await Promise.all([
+          runNonCriticalTask('Append log error:', () =>
+            appendLog([
+              nowIso(), mode, r[0], qty, oldBalance, newBalance, unit,
+              actorCtx.chatId, actorCtx.chatTitle, actorCtx.actor, role, note
+            ])
+          ),
+          runNonCriticalTask('Append report error:', () =>
+            appendReport(`${mode}_BULK`, `By=${actorCtx.actor}, Item=${r[0]}, Qty=${qty}, Before=${oldBalance}, After=${newBalance}, Note=${note}`)
+          )
+        ]);
 
-      if (mode === 'OUT') {
-        await checkAndSendLowStockAlert(actorCtx.chatId, updated);
-      }
+        if (mode === 'OUT') {
+          await checkAndSendLowStockAlert(actorCtx.chatId, updated);
+        }
 
-      return `✅ ${mode}: ${itemName} -> ${newBalance} ${unit}`;
+        return `✅ ${mode}: ${itemName} -> ${newBalance} ${unit}`;
+      });
     });
 
     results.push(result);
@@ -1641,19 +1870,15 @@ async function sendDailyLowStockSummariesIfDue() {
 
   for (const chat of allowedChats) {
     const chatId = String(chat[0] || '');
+    const chatTitle = clean(chat[1] || '');
     if (!chatId) continue;
 
-    if (lastDailySummaryDateByChat.get(chatId) === today) {
-      continue;
-    }
-
     const setting = await getGroupSetting(chatId);
-    if (!setting.dailyReportEnabled) {
-      continue;
-    }
+    if (!setting.dailyReportEnabled) continue;
+    if (setting.lastDailyReportDate === today) continue;
 
     await sendLongMessage(chatId, msg);
-    lastDailySummaryDateByChat.set(chatId, today);
+    await markDailyReportSent(chatId, chatTitle, today);
   }
 }
 
@@ -1697,13 +1922,74 @@ async function buildHealthMessage() {
   );
 }
 
+/**************** CONFIRM/CANCEL HELPERS ****************/
+async function confirmPendingActionByCode(code, msg, role, actorCtx) {
+  return await withLock(`pending:${code}`, async () => {
+    const pending = await findPendingActionByCode(code);
+    const validation = validatePendingActionOwnership(
+      pending,
+      actorCtx.username,
+      actorCtx.userId,
+      actorCtx.chatId
+    );
+
+    if (validation === 'expired') {
+      await updatePendingActionStatus(pending.rowIndex, 'expired');
+      return 'Confirmation code expired';
+    }
+
+    if (validation) {
+      return validation;
+    }
+
+    if (!canConfirmPending(role, pending.action)) {
+      return `You no longer have permission to confirm "${pending.action}"`;
+    }
+
+    try {
+      const resultMessage = await executeConfirmedAction(pending, msg, role, actorCtx);
+      await updatePendingActionStatus(pending.rowIndex, 'confirmed');
+      return `Confirmed\nCode: ${code}\n\n${resultMessage}`;
+    } catch (err) {
+      await runNonCriticalTask('PendingActions update error:', () =>
+        updatePendingActionStatus(pending.rowIndex, 'failed')
+      );
+      return `Failed to execute confirmation\nCode: ${code}\nReason: ${err.message}`;
+    }
+  });
+}
+
+async function cancelPendingActionByCode(code, actorCtx) {
+  return await withLock(`pending:${code}`, async () => {
+    const pending = await findPendingActionByCode(code);
+    const validation = validatePendingActionOwnership(
+      pending,
+      actorCtx.username,
+      actorCtx.userId,
+      actorCtx.chatId
+    );
+
+    if (validation === 'expired') {
+      await updatePendingActionStatus(pending.rowIndex, 'expired');
+      return 'Confirmation code expired';
+    }
+
+    if (validation) {
+      return validation;
+    }
+
+    await updatePendingActionStatus(pending.rowIndex, 'cancelled');
+    return `Cancelled\nCode: ${code}`;
+  });
+}
+
 /**************** COMMAND HANDLER ****************/
 async function handleCommand(msg) {
   const rawText = String(msg.text || '');
   const lines = String(rawText).split(/\r?\n/).map(s => clean(s)).filter(Boolean);
   const headerLine = lines[0] || '';
   const parts = parsePipe(headerLine);
-  const command = norm(parts[0]);
+  const command = normalizeCommand(parts[0]);
 
   const chatId = msg.chat.id;
   const actorCtx = getActorContext(msg);
@@ -1717,6 +2003,7 @@ async function handleCommand(msg) {
   const [roleRows, allowedChatRows] = await Promise.all([getRoles(), getAllowedChats()]);
   const role = getUserRoleFromRows(username, roleRows);
   const isWriteCommand = WRITE_COMMANDS.has(command);
+  const replyKeyboard = getDailyReplyKeyboard(role);
 
   if (isRateLimited(actorCtx, role, command)) {
     return sendMessage(chatId, '⏳ Too many write commands. Please slow down a bit.');
@@ -1766,7 +2053,7 @@ async function handleCommand(msg) {
     }
 
     /************ PERMISSION CHECK ************/
-    if (command !== '/start' && command !== '/help' && !canUseCommand(role, command)) {
+    if (command !== '/start' && command !== '/help' && command !== '/menu' && !canUseCommand(role, command)) {
       const displayUser = msg?.from?.username ? `@${msg.from.username}` : actor;
       return sendMessage(
         chatId,
@@ -1774,10 +2061,10 @@ async function handleCommand(msg) {
       );
     }
 
-    /************ HELP / START ************/
-    if (command === '/start' || command === '/help') {
+    /************ HELP / START / MENU ************/
+    if (command === '/start' || command === '/help' || command === '/menu') {
       if (role === 'super_admin') {
-        return sendLongMessage(
+        await sendLongMessage(
           chatId,
           '🤖 Stock Bot\n\n' +
           '👑 Super Admin:\n' +
@@ -1807,6 +2094,7 @@ async function handleCommand(msg) {
           '/stock | Item\n' +
           '/allstock\n' +
           '/alertstock\n' +
+          '/lowstock\n' +
           '/history | Item\n' +
           '/itemlogs | Item | limit\n' +
           '/today\n' +
@@ -1820,10 +2108,13 @@ async function handleCommand(msg) {
           '/confirm | CODE\n' +
           '/cancel | CODE'
         );
+        await sendMessage(chatId, '📌 Daily menu is ready', { replyMarkup: replyKeyboard });
+        await sendQuickActionsMenu(chatId);
+        return;
       }
 
       if (role === 'admin') {
-        return sendLongMessage(
+        await sendLongMessage(
           chatId,
           '🤖 Stock Bot\n\n' +
           '🛠 Admin:\n' +
@@ -1842,46 +2133,60 @@ async function handleCommand(msg) {
           '/stock | Item\n' +
           '/allstock\n' +
           '/alertstock\n' +
+          '/lowstock\n' +
           '/dashboard\n' +
           '/itemlogs | Item | limit\n' +
           '/health\n' +
           '/stats\n' +
+          '/today\n' +
           '/exportsummary\n' +
           '/exportlogs\n' +
           '/confirm | CODE\n' +
           '/cancel | CODE'
         );
+        await sendMessage(chatId, '📌 Daily menu is ready', { replyMarkup: replyKeyboard });
+        await sendQuickActionsMenu(chatId);
+        return;
       }
 
       if (role === 'member') {
-        return sendLongMessage(
+        await sendLongMessage(
           chatId,
           '🤖 Stock Bot\n\n' +
           '👥 Member:\n' +
           '/myrole\n' +
           '/in | Item | Qty | Optional Note\n' +
           '/out | Item | Qty | Optional Note\n' +
+          '/inbulk\nItem | Qty | Optional Note\n...\n' +
+          '/outbulk\nItem | Qty | Optional Note\n...\n' +
           '/search | keyword\n' +
           '/stock | Item\n' +
           '/allstock\n' +
           '/alertstock\n' +
+          '/lowstock\n' +
           '/dashboard\n' +
+          '/today\n' +
           '/itemlogs | Item | limit\n' +
           '/confirm | CODE\n' +
           '/cancel | CODE'
         );
+        await sendMessage(chatId, '📌 Daily menu is ready', { replyMarkup: replyKeyboard });
+        await sendQuickActionsMenu(chatId);
+        return;
       }
 
       return sendMessage(
         chatId,
-        '⛔ You are not registered to use this bot.\nPlease ask Super Admin to add your username.\n\n⚠️ Telegram username is required.'
+        '⛔ You are not registered to use this bot.\nPlease ask Super Admin to add your username.\n\n⚠️ Telegram username is required.',
+        { replyMarkup: replyKeyboard }
       );
     }
 
     if (command === '/myrole') {
       return sendMessage(
         chatId,
-        `👤 Username: ${username ? '@' + username : 'no username'}\n🔐 Role: ${role}`
+        `👤 Username: ${username ? '@' + username : 'no username'}\n🔐 Role: ${role}`,
+        { replyMarkup: replyKeyboard }
       );
     }
 
@@ -1923,7 +2228,13 @@ async function handleCommand(msg) {
       let msgOut = '📋 Allowed Groups\n\n';
       for (const r of rows) {
         const setting = await getGroupSetting(r[0]);
-        msgOut += `🆔 ${r[0]}\n🏷 ${clean(r[1] || '-')}\n🧩 ${clean(r[2] || '-')}\n📣 DailyReport: ${setting.dailyReportEnabled}\n🚨 Alerts: ${setting.lowStockAlertsEnabled}\n\n`;
+        msgOut +=
+          `🆔 ${r[0]}\n` +
+          `🏷 ${clean(r[1] || '-')}\n` +
+          `🧩 ${clean(r[2] || '-')}\n` +
+          `📣 DailyReport: ${setting.dailyReportEnabled}\n` +
+          `🚨 Alerts: ${setting.lowStockAlertsEnabled}\n` +
+          `🗓 LastDailyReport: ${setting.lastDailyReportDate || '-'}\n\n`;
       }
       return sendLongMessage(chatId, msgOut.trim());
     }
@@ -1936,7 +2247,8 @@ async function handleCommand(msg) {
       const added = await addAllowedChat(chatId, actorCtx.chatTitle, actorCtx.chatType);
       await upsertGroupSetting(chatId, actorCtx.chatTitle, {
         dailyReportEnabled: true,
-        lowStockAlertsEnabled: true
+        lowStockAlertsEnabled: true,
+        lastDailyReportDate: ''
       });
       await markProcessedIfNeeded();
       await appendReport('ALLOW_GROUP', `ChatId=${chatId}, Title=${actorCtx.chatTitle}, Added=${added}, By=${actor}`);
@@ -2041,62 +2353,18 @@ async function handleCommand(msg) {
       if (parts.length < 2) return sendMessage(chatId, 'Usage:\n/confirm | CODE');
 
       const code = clean(parts[1]);
-
-      return await withLock(`pending:${code}`, async () => {
-        const pending = await findPendingActionByCode(code);
-        const validation = validatePendingActionOwnership(pending, username, chatId);
-
-        if (validation === 'expired') {
-          await updatePendingActionStatus(pending.rowIndex, 'expired');
-          await markProcessedIfNeeded();
-          return sendMessage(chatId, 'Confirmation code expired');
-        }
-
-        if (validation) {
-          return sendMessage(chatId, validation);
-        }
-
-        if (!canConfirmPending(role, pending.action)) {
-          return sendMessage(chatId, `You no longer have permission to confirm "${pending.action}"`);
-        }
-
-        try {
-          const resultMessage = await executeConfirmedAction(pending, msg, role, actorCtx);
-          await updatePendingActionStatus(pending.rowIndex, 'confirmed');
-          await markProcessedIfNeeded();
-          return sendMessage(chatId, `Confirmed\nCode: ${code}\n\n${resultMessage}`);
-        } catch (err) {
-          await runNonCriticalTask('PendingActions update error:', () =>
-            updatePendingActionStatus(pending.rowIndex, 'failed')
-          );
-          return sendMessage(chatId, `Failed to execute confirmation\nCode: ${code}\nReason: ${err.message}`);
-        }
-      });
+      const resultMessage = await confirmPendingActionByCode(code, msg, role, actorCtx);
+      await markProcessedIfNeeded();
+      return sendMessage(chatId, resultMessage);
     }
 
     if (command === '/cancel') {
       if (parts.length < 2) return sendMessage(chatId, 'Usage:\n/cancel | CODE');
 
       const code = clean(parts[1]);
-
-      return await withLock(`pending:${code}`, async () => {
-        const pending = await findPendingActionByCode(code);
-        const validation = validatePendingActionOwnership(pending, username, chatId);
-
-        if (validation === 'expired') {
-          await updatePendingActionStatus(pending.rowIndex, 'expired');
-          await markProcessedIfNeeded();
-          return sendMessage(chatId, 'Confirmation code expired');
-        }
-
-        if (validation) {
-          return sendMessage(chatId, validation);
-        }
-
-        await updatePendingActionStatus(pending.rowIndex, 'cancelled');
-        await markProcessedIfNeeded();
-        return sendMessage(chatId, `Cancelled\nCode: ${code}`);
-      });
+      const resultMessage = await cancelPendingActionByCode(code, actorCtx);
+      await markProcessedIfNeeded();
+      return sendMessage(chatId, resultMessage);
     }
 
     if (command === '/additem') {
@@ -2116,21 +2384,23 @@ async function handleCommand(msg) {
       }
       if (!isValidUnit(unit)) return sendMessage(chatId, '⚠️ Invalid Unit');
 
-      return await withLock(`stock:${itemName}`, async () => {
-        const data = await getData();
-        const existing = findRowIndex(data, itemName);
-        if (existing !== -1) return sendMessage(chatId, `⚠️ Item already exists: ${itemName}`);
+      return await withStockSheetWriteLock(async () => {
+        return await withLock(`stock:${itemName}`, async () => {
+          const data = await getData();
+          const existing = findRowIndex(data, itemName);
+          if (existing !== -1) return sendMessage(chatId, `⚠️ Item already exists: ${itemName}`);
 
-        await appendRow([itemName, 0, 0, 0, minAlert, unit, nowIso()]);
-        await markProcessedIfNeeded();
-        await runNonCriticalTask('Append report error:', () =>
-          appendReport('ADD_ITEM', `By=${actor}, Item=${itemName}, MinAlert=${minAlert}, Unit=${unit}`)
-        );
+          await appendRow([itemName, 0, 0, 0, minAlert, unit, nowIso()]);
+          await markProcessedIfNeeded();
+          await runNonCriticalTask('Append report error:', () =>
+            appendReport('ADD_ITEM', `By=${actor}, Item=${itemName}, MinAlert=${minAlert}, Unit=${unit}`)
+          );
 
-        return sendMessage(
-          chatId,
-          `✅ Item Added\n\n💊 Item: ${itemName}\n⚠️ MinAlert: ${minAlert}\n📦 Unit: ${unit}`
-        );
+          return sendMessage(
+            chatId,
+            `✅ Item Added\n\n💊 Item: ${itemName}\n⚠️ MinAlert: ${minAlert}\n📦 Unit: ${unit}`
+          );
+        });
       });
     }
 
@@ -2176,41 +2446,43 @@ async function handleCommand(msg) {
       if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
       if (!assertValidQty(qty)) return sendMessage(chatId, '⚠️ Qty must be greater than 0');
 
-      return await withLock(`stock:${itemName}`, async () => {
-        const ref = await getStockRowByItemName(itemName);
-        if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+      return await withStockSheetWriteLock(async () => {
+        return await withLock(`stock:${itemName}`, async () => {
+          const ref = await getStockRowByItemName(itemName);
+          if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
 
-        const r = ref.row;
-        const currentIn = toNumber(r[1]);
-        const currentOut = toNumber(r[2]);
-        const minAlert = toNumber(r[4]);
-        const unit = clean(r[5] || '');
-        const oldBalance = getBalanceFromRow(r);
+          const r = ref.row;
+          const currentIn = toNumber(r[1]);
+          const currentOut = toNumber(r[2]);
+          const minAlert = toNumber(r[4]);
+          const unit = clean(r[5] || '');
+          const oldBalance = getBalanceFromRow(r);
 
-        const newIn = currentIn + qty;
-        const newBalance = newIn - currentOut;
+          const newIn = currentIn + qty;
+          const newBalance = newIn - currentOut;
 
-        const updated = [r[0], newIn, currentOut, newBalance, minAlert, unit, nowIso()];
-        await updateRow(ref.rowIndex, updated);
-        await markProcessedIfNeeded();
+          const updated = [r[0], newIn, currentOut, newBalance, minAlert, unit, nowIso()];
+          await updateRow(ref.rowIndex, updated);
+          await markProcessedIfNeeded();
 
-        await Promise.all([
-          runNonCriticalTask('Append log error:', () =>
-            appendLog([
-              nowIso(), 'IN', r[0], qty, oldBalance, newBalance, unit,
-              actorCtx.chatId, actorCtx.chatTitle, actor, role, note
-            ])
-          ),
-          runNonCriticalTask('Append report error:', () =>
-            appendReport('IN', `By=${actor}, Item=${r[0]}, Qty=${qty}, Before=${oldBalance}, After=${newBalance}, Note=${note}`)
-          )
-        ]);
+          await Promise.all([
+            runNonCriticalTask('Append log error:', () =>
+              appendLog([
+                nowIso(), 'IN', r[0], qty, oldBalance, newBalance, unit,
+                actorCtx.chatId, actorCtx.chatTitle, actor, role, note
+              ])
+            ),
+            runNonCriticalTask('Append report error:', () =>
+              appendReport('IN', `By=${actor}, Item=${r[0]}, Qty=${qty}, Before=${oldBalance}, After=${newBalance}, Note=${note}`)
+            )
+          ]);
 
-        return sendMessage(
-          chatId,
-          `📥 Stock Updated\n\n💊 Item: ${r[0]}\n➕ Qty In: ${qty}\n📦 Balance: ${newBalance} ${unit}` +
-          (note ? `\n📝 Note: ${note}` : '')
-        );
+          return sendMessage(
+            chatId,
+            `📥 Stock Updated\n\n💊 Item: ${r[0]}\n➕ Qty In: ${qty}\n📦 Balance: ${newBalance} ${unit}` +
+            (note ? `\n📝 Note: ${note}` : '')
+          );
+        });
       });
     }
 
@@ -2223,48 +2495,50 @@ async function handleCommand(msg) {
       if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
       if (!assertValidQty(qty)) return sendMessage(chatId, '⚠️ Qty must be greater than 0');
 
-      return await withLock(`stock:${itemName}`, async () => {
-        const ref = await getStockRowByItemName(itemName);
-        if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+      return await withStockSheetWriteLock(async () => {
+        return await withLock(`stock:${itemName}`, async () => {
+          const ref = await getStockRowByItemName(itemName);
+          if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
 
-        const r = ref.row;
-        const currentIn = toNumber(r[1]);
-        const currentOut = toNumber(r[2]);
-        const minAlert = toNumber(r[4]);
-        const unit = clean(r[5] || '');
-        const oldBalance = getBalanceFromRow(r);
+          const r = ref.row;
+          const currentIn = toNumber(r[1]);
+          const currentOut = toNumber(r[2]);
+          const minAlert = toNumber(r[4]);
+          const unit = clean(r[5] || '');
+          const oldBalance = getBalanceFromRow(r);
 
-        if (qty > oldBalance) {
-          return sendMessage(chatId, `❌ Not enough stock\n📦 Balance: ${oldBalance} ${unit}`);
-        }
+          if (qty > oldBalance) {
+            return sendMessage(chatId, `❌ Not enough stock\n📦 Balance: ${oldBalance} ${unit}`);
+          }
 
-        const newOut = currentOut + qty;
-        const newBalance = currentIn - newOut;
+          const newOut = currentOut + qty;
+          const newBalance = currentIn - newOut;
 
-        const updated = [r[0], currentIn, newOut, newBalance, minAlert, unit, nowIso()];
-        await updateRow(ref.rowIndex, updated);
-        await markProcessedIfNeeded();
+          const updated = [r[0], currentIn, newOut, newBalance, minAlert, unit, nowIso()];
+          await updateRow(ref.rowIndex, updated);
+          await markProcessedIfNeeded();
 
-        await Promise.all([
-          runNonCriticalTask('Append log error:', () =>
-            appendLog([
-              nowIso(), 'OUT', r[0], qty, oldBalance, newBalance, unit,
-              actorCtx.chatId, actorCtx.chatTitle, actor, role, note
-            ])
-          ),
-          runNonCriticalTask('Append report error:', () =>
-            appendReport('OUT', `By=${actor}, Item=${r[0]}, Qty=${qty}, Before=${oldBalance}, After=${newBalance}, Note=${note}`)
-          )
-        ]);
+          await Promise.all([
+            runNonCriticalTask('Append log error:', () =>
+              appendLog([
+                nowIso(), 'OUT', r[0], qty, oldBalance, newBalance, unit,
+                actorCtx.chatId, actorCtx.chatTitle, actor, role, note
+              ])
+            ),
+            runNonCriticalTask('Append report error:', () =>
+              appendReport('OUT', `By=${actor}, Item=${r[0]}, Qty=${qty}, Before=${oldBalance}, After=${newBalance}, Note=${note}`)
+            )
+          ]);
 
-        await sendMessage(
-          chatId,
-          `📤 Stock Updated\n\n💊 Item: ${r[0]}\n➖ Qty Out: ${qty}\n📦 Balance: ${newBalance} ${unit}` +
-          (note ? `\n📝 Note: ${note}` : '')
-        );
+          await sendMessage(
+            chatId,
+            `📤 Stock Updated\n\n💊 Item: ${r[0]}\n➖ Qty Out: ${qty}\n📦 Balance: ${newBalance} ${unit}` +
+            (note ? `\n📝 Note: ${note}` : '')
+          );
 
-        await checkAndSendLowStockAlert(chatId, updated);
-        return;
+          await checkAndSendLowStockAlert(chatId, updated);
+          return;
+        });
       });
     }
 
@@ -2279,39 +2553,42 @@ async function handleCommand(msg) {
         return sendMessage(chatId, '⚠️ NewBalance must be a valid number >= 0');
       }
 
-      return await withLock(`stock:${itemName}`, async () => {
-        const ref = await getStockRowByItemName(itemName);
-        if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+      return await withStockSheetWriteLock(async () => {
+        return await withLock(`stock:${itemName}`, async () => {
+          const ref = await getStockRowByItemName(itemName);
+          if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
 
-        const r = ref.row;
-        const currentIn = toNumber(r[1]);
-        const currentBalance = getBalanceFromRow(r);
-        const unit = clean(r[5] || '');
+          const r = ref.row;
+          const currentIn = toNumber(r[1]);
+          const currentBalance = getBalanceFromRow(r);
+          const unit = clean(r[5] || '');
 
-        if (newBalance > currentIn) {
+          if (newBalance > currentIn) {
+            return sendMessage(
+              chatId,
+              `⚠️ NewBalance cannot be greater than total In (${currentIn}).\nCurrent design keeps In unchanged and recalculates Out.`
+            );
+          }
+
+          const pending = await createPendingAction(username, actorCtx.userId, chatId, 'adjust', {
+            itemName,
+            newBalance
+          });
+          await markProcessedIfNeeded();
+
           return sendMessage(
             chatId,
-            `⚠️ NewBalance cannot be greater than total In (${currentIn}).\nCurrent design keeps In unchanged and recalculates Out.`
+            `⚠️ Confirm Adjust Required\n\n` +
+            `💊 Item: ${r[0]}\n` +
+            `📦 Current Balance: ${currentBalance} ${unit}\n` +
+            `✅ New Balance: ${newBalance} ${unit}\n\n` +
+            `🧾 Code: ${pending.code}\n` +
+            `⏳ Expires in ${CONFIRM_EXPIRE_MINUTES} minutes\n\n` +
+            `Confirm:\n/confirm | ${pending.code}\n\n` +
+            `Cancel:\n/cancel | ${pending.code}`,
+            { replyMarkup: buildPendingActionInlineKeyboard(pending.code) }
           );
-        }
-
-        const pending = await createPendingAction(username, chatId, 'adjust', {
-          itemName,
-          newBalance
         });
-        await markProcessedIfNeeded();
-
-        return sendMessage(
-          chatId,
-          `⚠️ Confirm Adjust Required\n\n` +
-          `💊 Item: ${r[0]}\n` +
-          `📦 Current Balance: ${currentBalance} ${unit}\n` +
-          `✅ New Balance: ${newBalance} ${unit}\n\n` +
-          `🧾 Code: ${pending.code}\n` +
-          `⏳ Expires in ${CONFIRM_EXPIRE_MINUTES} minutes\n\n` +
-          `Confirm:\n/confirm | ${pending.code}\n\n` +
-          `Cancel:\n/cancel | ${pending.code}`
-        );
       });
     }
 
@@ -2367,12 +2644,19 @@ async function handleCommand(msg) {
       const ref = await getStockRowByItemName(itemName);
       if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
 
-      return sendMessage(chatId, `📊 Stock Info\n\n${buildStockMessage(ref.row)}`);
+      await sendMessage(chatId, `📊 Stock Info\n\n${buildStockMessage(ref.row)}`, {
+        replyMarkup: buildQuickActionsInlineKeyboard()
+      });
+      return;
     }
 
     if (command === '/allstock') {
       const data = await getData();
-      if (data.length === 0) return sendMessage(chatId, '📭 No stock data');
+      if (data.length === 0) {
+        return sendMessage(chatId, '📭 No stock data', {
+          replyMarkup: buildQuickActionsInlineKeyboard()
+        });
+      }
 
       let msgOut = '📋 All Stock\n\n';
       for (const r of data) {
@@ -2383,15 +2667,27 @@ async function handleCommand(msg) {
         const status = balance <= minAlert ? ' 🚨LOW' : ' ✅OK';
         msgOut += `💊 ${item}: ${balance} ${unit}${status}\n`;
       }
-      return sendLongMessage(chatId, msgOut);
+
+      await sendLongMessage(chatId, msgOut, {
+        replyMarkup: buildQuickActionsInlineKeyboard()
+      });
+      return;
     }
 
     if (command === '/lowstock' || command === '/alertstock') {
       const data = await getData();
-      if (data.length === 0) return sendMessage(chatId, '📭 No stock data');
+      if (data.length === 0) {
+        return sendMessage(chatId, '📭 No stock data', {
+          replyMarkup: buildQuickActionsInlineKeyboard()
+        });
+      }
 
       const lowItems = data.filter(r => getBalanceFromRow(r) <= toNumber(r[4]));
-      if (lowItems.length === 0) return sendMessage(chatId, '✅ No low stock items');
+      if (lowItems.length === 0) {
+        return sendMessage(chatId, '✅ No low stock items', {
+          replyMarkup: buildQuickActionsInlineKeyboard()
+        });
+      }
 
       let msgOut = '🚨 Low Stock Items\n\n';
       for (const r of lowItems) {
@@ -2401,7 +2697,11 @@ async function handleCommand(msg) {
         const unit = clean(r[5] || '');
         msgOut += `💊 ${item}: ${balance} ${unit} (Min: ${minAlert})\n`;
       }
-      return sendLongMessage(chatId, msgOut);
+
+      await sendLongMessage(chatId, msgOut, {
+        replyMarkup: buildQuickActionsInlineKeyboard()
+      });
+      return;
     }
 
     if (command === '/setalert') {
@@ -2415,26 +2715,28 @@ async function handleCommand(msg) {
         return sendMessage(chatId, '⚠️ MinAlert must be a valid number');
       }
 
-      return await withLock(`stock:${itemName}`, async () => {
-        const ref = await getStockRowByItemName(itemName);
-        if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+      return await withStockSheetWriteLock(async () => {
+        return await withLock(`stock:${itemName}`, async () => {
+          const ref = await getStockRowByItemName(itemName);
+          if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
 
-        const r = ref.row;
-        const currentIn = toNumber(r[1]);
-        const currentOut = toNumber(r[2]);
-        const balance = getBalanceFromRow(r);
-        const unit = clean(r[5] || '');
+          const r = ref.row;
+          const currentIn = toNumber(r[1]);
+          const currentOut = toNumber(r[2]);
+          const balance = getBalanceFromRow(r);
+          const unit = clean(r[5] || '');
 
-        await updateRow(ref.rowIndex, [r[0], currentIn, currentOut, balance, minAlert, unit, nowIso()]);
-        await markProcessedIfNeeded();
-        await runNonCriticalTask('Append report error:', () =>
-          appendReport('SET_ALERT', `By=${actor}, Item=${r[0]}, MinAlert=${minAlert}`)
-        );
+          await updateRow(ref.rowIndex, [r[0], currentIn, currentOut, balance, minAlert, unit, nowIso()]);
+          await markProcessedIfNeeded();
+          await runNonCriticalTask('Append report error:', () =>
+            appendReport('SET_ALERT', `By=${actor}, Item=${r[0]}, MinAlert=${minAlert}`)
+          );
 
-        return sendMessage(
-          chatId,
-          `✅ MinAlert Updated\n\n💊 Item: ${r[0]}\n⚠️ New MinAlert: ${minAlert}`
-        );
+          return sendMessage(
+            chatId,
+            `✅ MinAlert Updated\n\n💊 Item: ${r[0]}\n⚠️ New MinAlert: ${minAlert}`
+          );
+        });
       });
     }
 
@@ -2447,21 +2749,23 @@ async function handleCommand(msg) {
       if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
       if (!isValidUnit(unit)) return sendMessage(chatId, '⚠️ Invalid Unit');
 
-      return await withLock(`stock:${itemName}`, async () => {
-        const ref = await getStockRowByItemName(itemName);
-        if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+      return await withStockSheetWriteLock(async () => {
+        return await withLock(`stock:${itemName}`, async () => {
+          const ref = await getStockRowByItemName(itemName);
+          if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
 
-        const r = ref.row;
-        await updateRow(ref.rowIndex, [r[0], toNumber(r[1]), toNumber(r[2]), getBalanceFromRow(r), toNumber(r[4]), unit, nowIso()]);
-        await markProcessedIfNeeded();
-        await runNonCriticalTask('Append report error:', () =>
-          appendReport('SET_UNIT', `By=${actor}, Item=${r[0]}, Unit=${unit}`)
-        );
+          const r = ref.row;
+          await updateRow(ref.rowIndex, [r[0], toNumber(r[1]), toNumber(r[2]), getBalanceFromRow(r), toNumber(r[4]), unit, nowIso()]);
+          await markProcessedIfNeeded();
+          await runNonCriticalTask('Append report error:', () =>
+            appendReport('SET_UNIT', `By=${actor}, Item=${r[0]}, Unit=${unit}`)
+          );
 
-        return sendMessage(
-          chatId,
-          `✅ Unit Updated\n\n💊 Item: ${r[0]}\n📦 New Unit: ${unit}`
-        );
+          return sendMessage(
+            chatId,
+            `✅ Unit Updated\n\n💊 Item: ${r[0]}\n📦 New Unit: ${unit}`
+          );
+        });
       });
     }
 
@@ -2481,32 +2785,34 @@ async function handleCommand(msg) {
 
       const lockKeys = [`stock:${oldName}`, `stock:${newName}`].sort();
 
-      return await withLock(lockKeys[0], async () => {
-        return await withLock(lockKeys[1], async () => {
-          const data = await getData();
+      return await withStockSheetWriteLock(async () => {
+        return await withLock(lockKeys[0], async () => {
+          return await withLock(lockKeys[1], async () => {
+            const data = await getData();
 
-          const oldRow = findRowIndex(data, oldName);
-          if (oldRow === -1) return sendMessage(chatId, `❌ Item not found: ${oldName}`);
+            const oldRow = findRowIndex(data, oldName);
+            if (oldRow === -1) return sendMessage(chatId, `❌ Item not found: ${oldName}`);
 
-          const existingNew = findRowIndex(data, newName);
-          if (existingNew !== -1) return sendMessage(chatId, `⚠️ Item already exists: ${newName}`);
+            const existingNew = findRowIndex(data, newName);
+            if (existingNew !== -1) return sendMessage(chatId, `⚠️ Item already exists: ${newName}`);
 
-          const r = data[oldRow];
-          await updateRow(oldRow, [
-            newName,
-            toNumber(r[1]),
-            toNumber(r[2]),
-            getBalanceFromRow(r),
-            toNumber(r[4]),
-            clean(r[5] || ''),
-            nowIso()
-          ]);
+            const r = data[oldRow];
+            await updateRow(oldRow, [
+              newName,
+              toNumber(r[1]),
+              toNumber(r[2]),
+              getBalanceFromRow(r),
+              toNumber(r[4]),
+              clean(r[5] || ''),
+              nowIso()
+            ]);
 
-          await markProcessedIfNeeded();
-          await runNonCriticalTask('Append report error:', () =>
-            appendReport('RENAME_ITEM', `By=${actor}, ${oldName} -> ${newName}`)
-          );
-          return sendMessage(chatId, `✅ Item Renamed\n\n📝 Old: ${oldName}\n✨ New: ${newName}`);
+            await markProcessedIfNeeded();
+            await runNonCriticalTask('Append report error:', () =>
+              appendReport('RENAME_ITEM', `By=${actor}, ${oldName} -> ${newName}`)
+            );
+            return sendMessage(chatId, `✅ Item Renamed\n\n📝 Old: ${oldName}\n✨ New: ${newName}`);
+          });
         });
       });
     }
@@ -2517,24 +2823,27 @@ async function handleCommand(msg) {
       const itemName = clean(parts[1]);
       if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
 
-      const data = await getData();
-      const row = findRowIndex(data, itemName);
-      if (row === -1) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+      return await withStockSheetWriteLock(async () => {
+        const data = await getData();
+        const row = findRowIndex(data, itemName);
+        if (row === -1) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
 
-      const pending = await createPendingAction(username, chatId, 'deleteitem', {
-        itemName
+        const pending = await createPendingAction(username, actorCtx.userId, chatId, 'deleteitem', {
+          itemName
+        });
+        await markProcessedIfNeeded();
+
+        return sendMessage(
+          chatId,
+          `⚠️ Confirm Delete Required\n\n` +
+          `💊 Item: ${itemName}\n\n` +
+          `🧾 Code: ${pending.code}\n` +
+          `⏳ Expires in ${CONFIRM_EXPIRE_MINUTES} minutes\n\n` +
+          `Confirm:\n/confirm | ${pending.code}\n\n` +
+          `Cancel:\n/cancel | ${pending.code}`,
+          { replyMarkup: buildPendingActionInlineKeyboard(pending.code) }
+        );
       });
-      await markProcessedIfNeeded();
-
-      return sendMessage(
-        chatId,
-        `⚠️ Confirm Delete Required\n\n` +
-        `💊 Item: ${itemName}\n\n` +
-        `🧾 Code: ${pending.code}\n` +
-        `⏳ Expires in ${CONFIRM_EXPIRE_MINUTES} minutes\n\n` +
-        `Confirm:\n/confirm | ${pending.code}\n\n` +
-        `Cancel:\n/cancel | ${pending.code}`
-      );
     }
 
     if (command === '/history') {
@@ -2622,7 +2931,11 @@ async function handleCommand(msg) {
 
       const totalTx = summary.inCount + summary.outCount + summary.adjustCount + summary.undoCount;
       if (totalTx === 0) {
-        return sendMessage(chatId, `📭 No transactions today (${summary.today}, ${APP_TIMEZONE})`);
+        return sendMessage(
+          chatId,
+          `📭 No transactions today (${summary.today}, ${APP_TIMEZONE})`,
+          { replyMarkup: buildQuickActionsInlineKeyboard() }
+        );
       }
 
       const msgOut =
@@ -2635,7 +2948,10 @@ async function handleCommand(msg) {
         `↩️ Undo Transactions: ${summary.undoCount}\n\n` +
         `🧾 Total Transactions: ${totalTx}`;
 
-      return sendMessage(chatId, msgOut);
+      await sendMessage(chatId, msgOut, {
+        replyMarkup: buildQuickActionsInlineKeyboard()
+      });
+      return;
     }
 
     if (command === '/report') {
@@ -2655,7 +2971,7 @@ async function handleCommand(msg) {
           msgOut += `💊 ${r[0]}: ${getBalanceFromRow(r)} ${clean(r[5] || '')} (Min: ${toNumber(r[4])})\n`;
         }
       } else {
-        msgOut += `✅ No low stock items`;
+        msgOut += '✅ No low stock items';
       }
 
       await appendReport(
@@ -2695,7 +3011,10 @@ async function handleCommand(msg) {
         msgOut += '✅ No low stock items';
       }
 
-      return sendLongMessage(chatId, msgOut);
+      await sendLongMessage(chatId, msgOut, {
+        replyMarkup: buildQuickActionsInlineKeyboard()
+      });
+      return;
     }
 
     if (command === '/audit') {
@@ -2803,10 +3122,167 @@ async function handleCommand(msg) {
   }
 }
 
+/**************** CALLBACK QUERY HANDLER ****************/
+async function handleCallbackQuery(callbackQuery) {
+  const data = clean(callbackQuery?.data || '');
+  const callbackId = callbackQuery?.id;
+  const msg = buildCallbackMsgLike(callbackQuery);
+
+  if (!data || !msg?.chat?.id) {
+    await answerCallbackQuery(callbackId, 'Invalid action', true);
+    return;
+  }
+
+  // QUICK ACTIONS
+  if (data.startsWith('QA|')) {
+    const quickAction = clean(data.split('|')[1] || '');
+    const chatId = msg.chat.id;
+
+    await clearInlineKeyboardFromCallback(callbackQuery);
+
+    if (quickAction === 'IN') {
+      await answerCallbackQuery(callbackId, 'បញ្ចូលស្តុក');
+      await sendForceReplyPrompt(
+        chatId,
+        'សូម reply តាម format ខាងក្រោម:\n/in | Item Name | Qty | Optional Note',
+        '/in | Paracetamol | 10 | received',
+        msg.message_id
+      );
+      return;
+    }
+
+    if (quickAction === 'OUT') {
+      await answerCallbackQuery(callbackId, 'ដកស្តុក');
+      await sendForceReplyPrompt(
+        chatId,
+        'សូម reply តាម format ខាងក្រោម:\n/out | Item Name | Qty | Optional Note',
+        '/out | Paracetamol | 5 | used',
+        msg.message_id
+      );
+      return;
+    }
+
+    if (quickAction === 'INBULK') {
+      await answerCallbackQuery(callbackId, 'បញ្ចូលស្តុក bulk');
+      await sendForceReplyPrompt(
+        chatId,
+        'សូម reply តាម format ខាងក្រោម:\n/inbulk\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note',
+        '/inbulk',
+        msg.message_id
+      );
+      return;
+    }
+
+    if (quickAction === 'OUTBULK') {
+      await answerCallbackQuery(callbackId, 'ដកស្តុក bulk');
+      await sendForceReplyPrompt(
+        chatId,
+        'សូម reply តាម format ខាងក្រោម:\n/outbulk\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note',
+        '/outbulk',
+        msg.message_id
+      );
+      return;
+    }
+
+    if (quickAction === 'STOCK') {
+      await answerCallbackQuery(callbackId, 'មើលស្តុក');
+      await sendForceReplyPrompt(
+        chatId,
+        'សូម reply តាម format ខាងក្រោម:\n/stock | Item Name',
+        '/stock | Paracetamol',
+        msg.message_id
+      );
+      return;
+    }
+
+    if (quickAction === 'LOWSTOCK') {
+      await answerCallbackQuery(callbackId, 'Low stock');
+      await handleCommand({
+        ...msg,
+        text: '/lowstock'
+      });
+      return;
+    }
+
+    if (quickAction === 'DASHBOARD') {
+      await answerCallbackQuery(callbackId, 'Dashboard');
+      await handleCommand({
+        ...msg,
+        text: '/dashboard'
+      });
+      return;
+    }
+
+    if (quickAction === 'MENU') {
+      await answerCallbackQuery(callbackId, 'Menu');
+      await handleCommand({
+        ...msg,
+        text: '/menu'
+      });
+      return;
+    }
+
+    await answerCallbackQuery(callbackId, 'Unknown quick action', true);
+    return;
+  }
+
+  const [actionRaw, codeRaw] = data.split('|');
+  const action = norm(actionRaw);
+  const code = clean(codeRaw);
+
+  if (!['confirm', 'cancel'].includes(action) || !code) {
+    await answerCallbackQuery(callbackId, 'Invalid action', true);
+    return;
+  }
+
+  const actorCtx = getActorContext(msg);
+  const username = actorCtx.username;
+  const chatId = msg.chat.id;
+
+  const [roleRows, allowedChatRows] = await Promise.all([getRoles(), getAllowedChats()]);
+  const role = getUserRoleFromRows(username, roleRows);
+
+  if (isGroupChat(msg)) {
+    if (allowedChatRows.length === 0 || !isAllowedChatId(chatId, allowedChatRows)) {
+      await answerCallbackQuery(callbackId, 'This group is not allowed', true);
+      return;
+    }
+  }
+
+  if (!canUseCommand(role, action === 'confirm' ? '/confirm' : '/cancel')) {
+    await answerCallbackQuery(callbackId, 'You are not allowed', true);
+    return;
+  }
+
+  await clearInlineKeyboardFromCallback(callbackQuery);
+
+  let resultMessage;
+  if (action === 'confirm') {
+    resultMessage = await confirmPendingActionByCode(code, msg, role, actorCtx);
+  } else {
+    resultMessage = await cancelPendingActionByCode(code, actorCtx);
+  }
+
+  const feedback = getCallbackFeedback(
+    resultMessage,
+    action === 'confirm' ? 'Confirmed' : 'Cancelled'
+  );
+
+  await answerCallbackQuery(callbackId, feedback.text, feedback.showAlert);
+  await sendMessage(chatId, resultMessage);
+}
+
 /**************** WEBHOOK ****************/
 app.post('/webhook', async (req, res) => {
   try {
     const msg = req.body.message;
+    const callbackQuery = req.body.callback_query;
+
+    if (callbackQuery) {
+      await handleCallbackQuery(callbackQuery);
+      return res.sendStatus(200);
+    }
+
     if (!msg || !msg.text) return res.sendStatus(200);
 
     await handleCommand(msg);
