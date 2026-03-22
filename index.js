@@ -27,18 +27,37 @@ const SHEET_CACHE_TTL_MS = getEnvNumber('SHEET_CACHE_TTL_MS', 5000, 0);
 const PROCESSED_MESSAGE_TTL_MS = getEnvNumber('PROCESSED_MESSAGE_TTL_MS', 30 * 60 * 1000, 1000);
 const PROCESSED_MESSAGE_CACHE_LIMIT = getEnvNumber('PROCESSED_MESSAGE_CACHE_LIMIT', 5000, 100);
 
+const CONFIRM_EXPIRE_MINUTES = getEnvNumber('CONFIRM_EXPIRE_MINUTES', 10, 1);
+const UNDO_WINDOW_MINUTES = getEnvNumber('UNDO_WINDOW_MINUTES', 30, 1);
+
+const RATE_LIMIT_WINDOW_MS = getEnvNumber('RATE_LIMIT_WINDOW_MS', 2000, 100);
+const RATE_LIMIT_MAX_WRITES = getEnvNumber('RATE_LIMIT_MAX_WRITES', 3, 1);
+
+const PROCESSED_MESSAGE_RETENTION_DAYS = getEnvNumber('PROCESSED_MESSAGE_RETENTION_DAYS', 14, 1);
+const PENDING_ACTION_RETENTION_DAYS = getEnvNumber('PENDING_ACTION_RETENTION_DAYS', 30, 1);
+const CLEANUP_INTERVAL_MS = getEnvNumber('CLEANUP_INTERVAL_MS', 10 * 60 * 1000, 60 * 1000);
+
+const DAILY_REPORT_HOUR = getEnvNumber('DAILY_REPORT_HOUR', 8, 0);
+const DAILY_REPORT_MINUTE = getEnvNumber('DAILY_REPORT_MINUTE', 0, 0);
+const DAILY_REPORT_CHECK_INTERVAL_MS = getEnvNumber('DAILY_REPORT_CHECK_INTERVAL_MS', 60 * 1000, 30 * 1000);
+
 const BOOTSTRAP_SUPER_ADMINS = (process.env.SUPER_ADMINS || '')
   .split(',')
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 
 const TELEGRAM_API = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
-const CONFIRM_EXPIRE_MINUTES = 10;
 
-const GROUP_BYPASS_COMMANDS = new Set(['/allowgroup', '/start', '/help']);
+const GROUP_BYPASS_COMMANDS = new Set(['/allowgroup', '/start', '/help', '/myrole']);
 const WRITE_COMMANDS = new Set([
+  '/addsuperadmin', '/removesuperadmin',
+  '/addadmin', '/removeadmin',
+  '/addmember', '/removemember',
+  '/allowgroup', '/disallowgroup',
   '/additem', '/deleteitem', '/in', '/out', '/adjust',
-  '/setalert', '/setunit', '/renameitem', '/confirm', '/cancel'
+  '/setalert', '/setunit', '/renameitem', '/confirm', '/cancel',
+  '/undo', '/setdailyreport', '/setalerts',
+  '/additemsbulk', '/inbulk', '/outbulk'
 ]);
 
 const telegramHttp = axios.create({
@@ -64,6 +83,9 @@ const dateFormatterCache = new Map();
 const processedMessageCache = new Map();
 const processedMessageInflight = new Set();
 const sheetIdCache = new Map();
+const rateLimitCache = new Map();
+const lastDailySummaryDateByChat = new Map();
+
 let spreadsheetMetaCache = {
   data: null,
   expiresAt: 0
@@ -148,9 +170,14 @@ function minutesFromNowIso(minutes) {
   return new Date(Date.now() + minutes * 60 * 1000).toISOString();
 }
 
+function daysAgoIso(days) {
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
 function isExpired(isoString) {
   if (!isoString) return true;
-  return new Date(isoString).getTime() < Date.now();
+  const t = new Date(isoString).getTime();
+  return Number.isNaN(t) || t < Date.now();
 }
 
 function getDateFormatter(timeZone = APP_TIMEZONE) {
@@ -170,6 +197,19 @@ function getDateFormatter(timeZone = APP_TIMEZONE) {
   return formatter;
 }
 
+function getTimeParts(timeZone = APP_TIMEZONE, date = new Date()) {
+  const fmt = new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  });
+  const parts = fmt.formatToParts(date);
+  const hour = Number(parts.find(p => p.type === 'hour')?.value || 0);
+  const minute = Number(parts.find(p => p.type === 'minute')?.value || 0);
+  return { hour, minute };
+}
+
 function getLocalDateString(timeZone = APP_TIMEZONE) {
   return getDateFormatter(timeZone).format(new Date());
 }
@@ -183,10 +223,14 @@ function isValidItemName(name) {
   return Boolean(s) && s.length <= 100 && !/[\r\n]/.test(s) && !s.includes('|');
 }
 
+function isValidUnit(unit) {
+  const s = clean(unit);
+  return Boolean(s) && s.length <= 30 && !/[\r\n]/.test(s) && !s.includes('|');
+}
+
 function escapeCsv(value) {
   let s = String(value ?? '');
 
-  // Prevent CSV/Excel/Sheets formula injection
   if (/^[=+\-@]/.test(s)) {
     s = "'" + s;
   }
@@ -221,6 +265,16 @@ function isGroupChat(msg) {
 function makeConfirmCode(prefix = 'CF') {
   const rand = Math.random().toString(36).slice(2, 8).toUpperCase();
   return `${prefix}${Date.now().toString().slice(-6)}${rand}`;
+}
+
+function assertValidQty(qty) {
+  return Number.isFinite(qty) && qty > 0;
+}
+
+function parseQtyAndOptionalNote(parts) {
+  const qty = Number(parts[2]);
+  const note = parts.length >= 4 ? clean(parts.slice(3).join(' | ')) : '';
+  return { qty, note };
 }
 
 async function sendMessage(chatId, text) {
@@ -301,6 +355,21 @@ function getStockRowObject(r) {
     unit: clean(r[5] || ''),
     updatedAt: clean(r[6] || '')
   };
+}
+
+function buildStockMessage(row) {
+  const stock = getStockRowObject(row);
+  const status = stock.balance <= stock.minAlert ? '🚨LOW STOCK' : '✅OK';
+
+  return (
+    `💊 Item: ${stock.item}\n` +
+    `📥 In: ${stock.inQty}\n` +
+    `📤 Out: ${stock.outQty}\n` +
+    `📦 Balance: ${stock.balance} ${stock.unit}\n` +
+    `⚠️ MinAlert: ${stock.minAlert}\n` +
+    `🕒 UpdatedAt: ${stock.updatedAt || '-'}\n` +
+    `📌 Status: ${status}`
+  );
 }
 
 function toA1Column(n) {
@@ -391,14 +460,98 @@ function rememberProcessedMessage(key) {
   pruneProcessedMessageCache();
 }
 
-async function finalizeProcessedMessage(messageId, chatId, command, key) {
+async function safeMarkProcessedMessage({ messageId, chatId, command, key }) {
   if (!key) return;
-
-  rememberProcessedMessage(key);
-  releaseProcessedMessage(key);
-  await runNonCriticalTask('ProcessedMessages append error:', async () => {
+  try {
     await appendProcessedMessage(messageId, chatId, command);
-  });
+    rememberProcessedMessage(key);
+  } catch (err) {
+    logError('safeMarkProcessedMessage error:', err);
+  } finally {
+    releaseProcessedMessage(key);
+  }
+}
+
+async function acquireWriteCommandGuard(messageId, chatId) {
+  const key = beginProcessedMessage(messageId, chatId);
+  if (!key) {
+    return { ok: false, reason: 'duplicate_memory' };
+  }
+
+  try {
+    const alreadyProcessed = await isMessageProcessed(messageId, chatId);
+    if (alreadyProcessed) {
+      releaseProcessedMessage(key);
+      return { ok: false, reason: 'duplicate_sheet' };
+    }
+
+    return { ok: true, key };
+  } catch (err) {
+    releaseProcessedMessage(key);
+    throw err;
+  }
+}
+
+function validatePendingActionOwnership(pending, username, chatId) {
+  if (!pending) return 'Confirmation code not found';
+  if (pending.status !== 'pending') return `This request is already ${pending.status}`;
+  if (pending.username !== username) return 'This confirmation code is not yours';
+  if (pending.chatId !== String(chatId)) return 'This confirmation code belongs to another chat';
+  if (isExpired(pending.expiresAt)) return 'expired';
+  return null;
+}
+
+function isRateLimited(actorCtx, role, command) {
+  if (!WRITE_COMMANDS.has(command)) return false;
+  if (role === 'super_admin') return false;
+
+  const key = `${actorCtx.chatId}:${actorCtx.userId}`;
+  const now = Date.now();
+  const entries = rateLimitCache.get(key) || [];
+  const fresh = entries.filter(ts => now - ts <= RATE_LIMIT_WINDOW_MS);
+  fresh.push(now);
+  rateLimitCache.set(key, fresh);
+  return fresh.length > RATE_LIMIT_MAX_WRITES;
+}
+
+function pruneRateLimitCache() {
+  const now = Date.now();
+  for (const [key, entries] of rateLimitCache) {
+    const fresh = entries.filter(ts => now - ts <= RATE_LIMIT_WINDOW_MS);
+    if (fresh.length === 0) {
+      rateLimitCache.delete(key);
+    } else {
+      rateLimitCache.set(key, fresh);
+    }
+  }
+}
+
+async function getStockRowByItemName(itemName) {
+  const data = await getData();
+  const rowIndex = findRowIndex(data, itemName);
+  if (rowIndex === -1) return null;
+
+  return {
+    data,
+    rowIndex,
+    row: data[rowIndex],
+    stock: getStockRowObject(data[rowIndex])
+  };
+}
+
+function parseMultilineEntries(rawText) {
+  return String(rawText || '')
+    .split(/\r?\n/)
+    .slice(1)
+    .map(line => clean(line))
+    .filter(Boolean);
+}
+
+function parseOnOff(value) {
+  const v = norm(value);
+  if (['on', 'true', '1', 'yes', 'enable', 'enabled'].includes(v)) return true;
+  if (['off', 'false', '0', 'no', 'disable', 'disabled'].includes(v)) return false;
+  return null;
 }
 
 /**************** SHEET CONFIG ****************/
@@ -409,7 +562,8 @@ const SHEET_HEADERS = {
   Roles: ['Username', 'Role', 'UpdatedAt'],
   AllowedChats: ['ChatId', 'ChatTitle', 'ChatType', 'AddedAt'],
   PendingActions: ['Code', 'Username', 'ChatId', 'Action', 'PayloadJson', 'Status', 'CreatedAt', 'ExpiresAt'],
-  ProcessedMessages: ['MessageId', 'ChatId', 'Command', 'ProcessedAt']
+  ProcessedMessages: ['MessageId', 'ChatId', 'Command', 'ProcessedAt'],
+  GroupSettings: ['ChatId', 'ChatTitle', 'DailyReportEnabled', 'LowStockAlertsEnabled', 'UpdatedAt']
 };
 
 const SHEET_RANGES = {
@@ -418,12 +572,14 @@ const SHEET_RANGES = {
   Roles: "'Roles'!A2:C",
   AllowedChats: "'AllowedChats'!A2:D",
   PendingActions: "'PendingActions'!A2:H",
-  ProcessedMessages: "'ProcessedMessages'!A2:D"
+  ProcessedMessages: "'ProcessedMessages'!A2:D",
+  GroupSettings: "'GroupSettings'!A2:E"
 };
 
 const SHEET_CACHE_KEYS = {
   Roles: 'sheet:roles',
-  AllowedChats: 'sheet:allowed_chats'
+  AllowedChats: 'sheet:allowed_chats',
+  GroupSettings: 'sheet:group_settings'
 };
 
 function isCacheEntryFresh(entry) {
@@ -445,7 +601,8 @@ function invalidateRowCache(cacheKey) {
 }
 
 function invalidateSheetCache(sheetTitle) {
-  invalidateRowCache(SHEET_CACHE_KEYS[sheetTitle]);
+  const cacheKey = SHEET_CACHE_KEYS[sheetTitle];
+  if (cacheKey) invalidateRowCache(cacheKey);
 }
 
 async function getCachedSheetRows(cacheKey, range, ttlMs = SHEET_CACHE_TTL_MS) {
@@ -495,23 +652,6 @@ async function getSpreadsheetMeta(options = {}) {
   return meta.data;
 }
 
-async function legacyEnsureSheetExists(title) {
-  const meta = await getSpreadsheetMeta();
-  const existing = (meta.sheets || []).find(s => s.properties.title === title);
-  if (existing) return existing.properties.sheetId;
-
-  const res = await sheets.spreadsheets.batchUpdate({
-    spreadsheetId: SPREADSHEET_ID,
-    requestBody: {
-      requests: [{ addSheet: { properties: { title } } }]
-    }
-  });
-
-  const addedSheet = res.data.replies?.[0]?.addSheet?.properties;
-  console.log(`✅ Created sheet: ${title}`);
-  return addedSheet?.sheetId;
-}
-
 async function getSheetId(sheetTitle) {
   if (sheetIdCache.has(sheetTitle)) {
     return sheetIdCache.get(sheetTitle);
@@ -544,7 +684,7 @@ async function ensureSheetsExist(titles) {
   });
 
   for (const title of missingTitles) {
-    console.log(`âœ… Created sheet: ${title}`);
+    console.log(`✅ Created sheet: ${title}`);
   }
 
   return getSpreadsheetMeta({ force: true });
@@ -621,6 +761,10 @@ async function getProcessedMessages() {
   return res.data.values || [];
 }
 
+async function getGroupSettingsRows() {
+  return getCachedSheetRows(SHEET_CACHE_KEYS.GroupSettings, SHEET_RANGES.GroupSettings);
+}
+
 async function appendRow(values) {
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
@@ -628,7 +772,6 @@ async function appendRow(values) {
     valueInputOption: 'RAW',
     requestBody: { values: [values] }
   });
-  invalidateSheetCache('Stock');
 }
 
 async function updateRow(rowIndex, values) {
@@ -638,7 +781,6 @@ async function updateRow(rowIndex, values) {
     valueInputOption: 'RAW',
     requestBody: { values: [values] }
   });
-  invalidateSheetCache('Stock');
 }
 
 async function appendLog(values) {
@@ -706,6 +848,98 @@ async function deleteRowFromSheet(sheetTitle, rowIndexZeroBasedWithoutHeader) {
     }
   });
   invalidateSheetCache(sheetTitle);
+}
+
+async function deleteRowsFromSheet(sheetTitle, rowIndexesZeroBasedWithoutHeader) {
+  if (!rowIndexesZeroBasedWithoutHeader || rowIndexesZeroBasedWithoutHeader.length === 0) return;
+  const sheetId = await getSheetId(sheetTitle);
+  const sorted = [...new Set(rowIndexesZeroBasedWithoutHeader)].sort((a, b) => b - a);
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: {
+      requests: sorted.map(idx => ({
+        deleteDimension: {
+          range: {
+            sheetId,
+            dimension: 'ROWS',
+            startIndex: idx + 1,
+            endIndex: idx + 2
+          }
+        }
+      }))
+    }
+  });
+
+  invalidateSheetCache(sheetTitle);
+}
+
+/**************** GROUP SETTINGS ****************/
+async function getGroupSetting(chatId) {
+  const rows = await getGroupSettingsRows();
+  const found = rows.find(r => String(r[0] || '') === String(chatId));
+  if (!found) {
+    return {
+      chatId: String(chatId),
+      chatTitle: '',
+      dailyReportEnabled: true,
+      lowStockAlertsEnabled: true,
+      updatedAt: ''
+    };
+  }
+
+  return {
+    chatId: String(found[0] || ''),
+    chatTitle: clean(found[1] || ''),
+    dailyReportEnabled: norm(found[2]) !== 'false',
+    lowStockAlertsEnabled: norm(found[3]) !== 'false',
+    updatedAt: clean(found[4] || '')
+  };
+}
+
+async function upsertGroupSetting(chatId, chatTitle, partial) {
+  const rows = await getGroupSettingsRows();
+  let idx = -1;
+  for (let i = 0; i < rows.length; i++) {
+    if (String(rows[i][0] || '') === String(chatId)) {
+      idx = i;
+      break;
+    }
+  }
+
+  const current = idx === -1
+    ? { dailyReportEnabled: true, lowStockAlertsEnabled: true, chatTitle: clean(chatTitle) }
+    : {
+        dailyReportEnabled: norm(rows[idx][2]) !== 'false',
+        lowStockAlertsEnabled: norm(rows[idx][3]) !== 'false',
+        chatTitle: clean(rows[idx][1] || chatTitle)
+      };
+
+  const values = [
+    String(chatId),
+    clean(chatTitle || current.chatTitle),
+    String(partial.dailyReportEnabled ?? current.dailyReportEnabled),
+    String(partial.lowStockAlertsEnabled ?? current.lowStockAlertsEnabled),
+    nowIso()
+  ];
+
+  if (idx === -1) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: "'GroupSettings'!A:E",
+      valueInputOption: 'RAW',
+      requestBody: { values: [values] }
+    });
+  } else {
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `'GroupSettings'!A${idx + 2}:E${idx + 2}`,
+      valueInputOption: 'RAW',
+      requestBody: { values: [values] }
+    });
+  }
+
+  invalidateSheetCache('GroupSettings');
 }
 
 /**************** ROLES ****************/
@@ -882,6 +1116,80 @@ async function updatePendingActionStatus(rowIndex, status) {
   });
 }
 
+async function cleanupExpiredPendingActions() {
+  const rows = await getPendingActions();
+
+  for (let i = 0; i < rows.length; i++) {
+    const status = clean(rows[i][5]);
+    const expiresAt = clean(rows[i][7]);
+
+    if (status === 'pending' && isExpired(expiresAt)) {
+      await runNonCriticalTask('cleanupExpiredPendingActions error:', async () => {
+        await updatePendingActionStatus(i, 'expired');
+      });
+    }
+  }
+}
+
+async function cleanupOldPendingActions(days = PENDING_ACTION_RETENTION_DAYS) {
+  const rows = await getPendingActions();
+  const cutoff = new Date(daysAgoIso(days)).getTime();
+  const deleteIndexes = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const status = clean(rows[i][5]);
+    const createdAt = clean(rows[i][6]);
+    const t = new Date(createdAt).getTime();
+    if (Number.isNaN(t)) continue;
+
+    if (['confirmed', 'cancelled', 'failed', 'expired'].includes(status) && t < cutoff) {
+      deleteIndexes.push(i);
+    }
+  }
+
+  if (deleteIndexes.length > 0) {
+    await deleteRowsFromSheet('PendingActions', deleteIndexes);
+  }
+
+  return deleteIndexes.length;
+}
+
+async function cleanupOldProcessedMessages(days = PROCESSED_MESSAGE_RETENTION_DAYS) {
+  const rows = await getProcessedMessages();
+  const cutoff = new Date(daysAgoIso(days)).getTime();
+  const deleteIndexes = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const processedAt = clean(rows[i][3]);
+    const t = new Date(processedAt).getTime();
+    if (!Number.isNaN(t) && t < cutoff) {
+      deleteIndexes.push(i);
+    }
+  }
+
+  if (deleteIndexes.length > 0) {
+    await deleteRowsFromSheet('ProcessedMessages', deleteIndexes);
+  }
+
+  return deleteIndexes.length;
+}
+
+async function autoCleanupSheets() {
+  await cleanupExpiredPendingActions();
+
+  const [processedDeleted, pendingDeleted] = await Promise.all([
+    cleanupOldProcessedMessages(),
+    cleanupOldPendingActions()
+  ]);
+
+  if (processedDeleted > 0 || pendingDeleted > 0) {
+    await appendReport(
+      'AUTO_CLEANUP',
+      `ProcessedMessagesDeleted=${processedDeleted}, PendingActionsDeleted=${pendingDeleted}`
+    );
+  }
+}
+
 /**************** PERMISSIONS ****************/
 const ROLE_COMMANDS = {
   super_admin: new Set([
@@ -894,18 +1202,27 @@ const ROLE_COMMANDS = {
     '/alertstock', '/lowstock',
     '/setalert', '/setunit', '/renameitem', '/deleteitem',
     '/history', '/today', '/report', '/exportsummary', '/adjust',
-    '/search', '/exportlogs', '/confirm', '/cancel'
+    '/search', '/exportlogs', '/confirm', '/cancel',
+    '/undo', '/dashboard', '/itemlogs', '/audit',
+    '/health', '/stats',
+    '/setdailyreport', '/setalerts',
+    '/additemsbulk', '/inbulk', '/outbulk'
   ]),
   admin: new Set([
     '/start', '/help', '/myrole',
     '/additem', '/deleteitem', '/exportsummary',
     '/in', '/out', '/stock', '/allstock', '/alertstock', '/lowstock',
-    '/search', '/exportlogs', '/confirm', '/cancel'
+    '/search', '/exportlogs', '/confirm', '/cancel',
+    '/undo', '/dashboard', '/itemlogs',
+    '/health', '/stats',
+    '/setdailyreport', '/setalerts',
+    '/additemsbulk', '/inbulk', '/outbulk'
   ]),
   member: new Set([
     '/start', '/help', '/myrole',
     '/in', '/out', '/stock', '/allstock', '/alertstock', '/lowstock',
-    '/search', '/confirm', '/cancel'
+    '/search', '/confirm', '/cancel',
+    '/dashboard', '/itemlogs'
   ])
 };
 
@@ -914,7 +1231,15 @@ function canUseCommand(role, command) {
 }
 
 /**************** ALERT ****************/
+async function isLowStockAlertEnabled(chatId) {
+  const setting = await getGroupSetting(chatId);
+  return setting.lowStockAlertsEnabled;
+}
+
 async function checkAndSendLowStockAlert(chatId, row) {
+  const enabled = await isLowStockAlertEnabled(chatId);
+  if (!enabled) return;
+
   const balance = getBalanceFromRow(row);
   const minAlert = toNumber(row[4]);
   const unit = clean(row[5] || '');
@@ -947,6 +1272,59 @@ function summarizeStock(data) {
   }
 
   return { totalItems, lowStockCount, totalBalance };
+}
+
+function summarizeTodayLogs(logs, timeZone = APP_TIMEZONE) {
+  const today = getLocalDateString(timeZone);
+  let inCount = 0;
+  let outCount = 0;
+  let adjustCount = 0;
+  let undoCount = 0;
+  let inQty = 0;
+  let outQty = 0;
+
+  for (const r of logs) {
+    const ts = clean(r[0] || '');
+    if (!ts) continue;
+    const d = new Date(ts);
+    if (Number.isNaN(d.getTime())) continue;
+    if (getLocalDateStringFromDate(d, timeZone) !== today) continue;
+
+    const type = clean(r[1] || '');
+    const qty = toNumber(r[3]);
+
+    if (type === 'IN') {
+      inCount += 1;
+      inQty += qty;
+    } else if (type === 'OUT') {
+      outCount += 1;
+      outQty += qty;
+    } else if (type === 'ADJUST') {
+      adjustCount += 1;
+    } else if (type === 'UNDO') {
+      undoCount += 1;
+    }
+  }
+
+  return { today, inCount, outCount, adjustCount, undoCount, inQty, outQty };
+}
+
+function buildLowStockSummaryMessage(data) {
+  const lowItems = data.filter(r => getBalanceFromRow(r) <= toNumber(r[4]));
+  if (lowItems.length === 0) {
+    return '✅ Daily Low Stock Summary\n\nNo low stock items today.';
+  }
+
+  let msg = '📣 Daily Low Stock Summary\n\n';
+  for (const r of lowItems.slice(0, 50)) {
+    msg += `💊 ${clean(r[0] || '')}: ${getBalanceFromRow(r)} ${clean(r[5] || '')} (Min: ${toNumber(r[4])})\n`;
+  }
+
+  if (lowItems.length > 50) {
+    msg += `\n...and ${lowItems.length - 50} more items`;
+  }
+
+  return msg;
 }
 
 /**************** EXECUTE CONFIRMED ACTION ****************/
@@ -1016,6 +1394,7 @@ async function executeConfirmedAction(pending, msg, role, actorCtx) {
           appendReport('ADJUST', `By=${actorCtx.actor}, Item=${r[0]}, Before=${oldBalance}, After=${newBalance}`)
         )
       ]);
+
       await checkAndSendLowStockAlert(actorCtx.chatId, updated);
 
       return (
@@ -1030,12 +1409,303 @@ async function executeConfirmedAction(pending, msg, role, actorCtx) {
   throw new Error(`Unknown pending action: ${pending.action}`);
 }
 
+/**************** UNDO ****************/
+async function getLastUndoableLogForItem(itemName) {
+  const logs = await getLogs();
+  const filtered = logs
+    .map((r, i) => ({ row: r, idx: i }))
+    .filter(x => norm(x.row[2]) === norm(itemName))
+    .filter(x => ['IN', 'OUT'].includes(clean(x.row[1] || '')))
+    .reverse();
+
+  return filtered[0] || null;
+}
+
+async function undoLastAction(itemName, actorCtx, role) {
+  return await withLock(`stock:${itemName}`, async () => {
+    const stockRef = await getStockRowByItemName(itemName);
+    if (!stockRef) {
+      throw new Error(`Item not found: ${itemName}`);
+    }
+
+    const lastLog = await getLastUndoableLogForItem(itemName);
+    if (!lastLog) {
+      throw new Error(`No undoable IN/OUT history found for: ${itemName}`);
+    }
+
+    const actionTs = new Date(clean(lastLog.row[0] || '')).getTime();
+    if (Number.isNaN(actionTs)) {
+      throw new Error('Last log timestamp is invalid');
+    }
+
+    if (Date.now() - actionTs > UNDO_WINDOW_MINUTES * 60 * 1000) {
+      throw new Error(`Undo window expired. Allowed within ${UNDO_WINDOW_MINUTES} minutes`);
+    }
+
+    const r = stockRef.row;
+    const currentIn = toNumber(r[1]);
+    const currentOut = toNumber(r[2]);
+    const currentBalance = getBalanceFromRow(r);
+    const minAlert = toNumber(r[4]);
+    const unit = clean(r[5] || '');
+
+    const logType = clean(lastLog.row[1] || '');
+    const qty = toNumber(lastLog.row[3]);
+
+    let newIn = currentIn;
+    let newOut = currentOut;
+    let note = '';
+
+    if (logType === 'IN') {
+      if (qty > currentIn) {
+        throw new Error('Cannot undo last IN because current total In is less than logged Qty');
+      }
+      newIn = currentIn - qty;
+      if (newIn < currentOut) {
+        throw new Error('Cannot undo last IN because resulting balance would be negative');
+      }
+      note = `Undo last IN of ${qty}`;
+    } else if (logType === 'OUT') {
+      if (qty > currentOut) {
+        throw new Error('Cannot undo last OUT because current total Out is less than logged Qty');
+      }
+      newOut = currentOut - qty;
+      note = `Undo last OUT of ${qty}`;
+    } else {
+      throw new Error('Last action is not undoable');
+    }
+
+    const newBalance = newIn - newOut;
+    const updated = [r[0], newIn, newOut, newBalance, minAlert, unit, nowIso()];
+    await updateRow(stockRef.rowIndex, updated);
+
+    await Promise.all([
+      runNonCriticalTask('Append log error:', () =>
+        appendLog([
+          nowIso(), 'UNDO', r[0], qty, currentBalance, newBalance, unit,
+          actorCtx.chatId, actorCtx.chatTitle, actorCtx.actor, role, note
+        ])
+      ),
+      runNonCriticalTask('Append report error:', () =>
+        appendReport('UNDO', `By=${actorCtx.actor}, Item=${r[0]}, ${note}, Before=${currentBalance}, After=${newBalance}`)
+      )
+    ]);
+
+    await checkAndSendLowStockAlert(actorCtx.chatId, updated);
+
+    return (
+      `↩️ Undo Success\n\n` +
+      `💊 Item: ${r[0]}\n` +
+      `📝 Action: ${note}\n` +
+      `📦 Old Balance: ${currentBalance} ${unit}\n` +
+      `✅ New Balance: ${newBalance} ${unit}`
+    );
+  });
+}
+
+/**************** BULK HELPERS ****************/
+async function processBulkAddItems(entries, actorCtx, role) {
+  const results = [];
+  for (const line of entries) {
+    const parts = parsePipe(line);
+    if (parts.length < 3) {
+      results.push(`❌ Invalid line: ${line}`);
+      continue;
+    }
+
+    const itemName = clean(parts[0]);
+    const minAlert = Number(parts[1]);
+    const unit = clean(parts[2]);
+
+    if (!isValidItemName(itemName)) {
+      results.push(`❌ Invalid item name: ${itemName || line}`);
+      continue;
+    }
+    if (Number.isNaN(minAlert) || minAlert < 0) {
+      results.push(`❌ Invalid MinAlert for ${itemName}`);
+      continue;
+    }
+    if (!isValidUnit(unit)) {
+      results.push(`❌ Invalid Unit for ${itemName}`);
+      continue;
+    }
+
+    const result = await withLock(`stock:${itemName}`, async () => {
+      const data = await getData();
+      const existing = findRowIndex(data, itemName);
+      if (existing !== -1) {
+        return `⚠️ Already exists: ${itemName}`;
+      }
+
+      await appendRow([itemName, 0, 0, 0, minAlert, unit, nowIso()]);
+      await runNonCriticalTask('Append report error:', () =>
+        appendReport('ADD_ITEM_BULK', `By=${actorCtx.actor}, Item=${itemName}, MinAlert=${minAlert}, Unit=${unit}`)
+      );
+      return `✅ Added: ${itemName}`;
+    });
+
+    results.push(result);
+  }
+
+  return results;
+}
+
+async function processBulkMovement(entries, mode, actorCtx, role) {
+  const results = [];
+
+  for (const line of entries) {
+    const parts = parsePipe(line);
+    if (parts.length < 2) {
+      results.push(`❌ Invalid line: ${line}`);
+      continue;
+    }
+
+    const itemName = clean(parts[0]);
+    const qty = Number(parts[1]);
+    const note = parts.length >= 3 ? clean(parts.slice(2).join(' | ')) : '';
+
+    if (!isValidItemName(itemName)) {
+      results.push(`❌ Invalid item name: ${itemName || line}`);
+      continue;
+    }
+    if (!assertValidQty(qty)) {
+      results.push(`❌ Invalid Qty for ${itemName}`);
+      continue;
+    }
+
+    const result = await withLock(`stock:${itemName}`, async () => {
+      const ref = await getStockRowByItemName(itemName);
+      if (!ref) return `❌ Item not found: ${itemName}`;
+
+      const r = ref.row;
+      const currentIn = toNumber(r[1]);
+      const currentOut = toNumber(r[2]);
+      const minAlert = toNumber(r[4]);
+      const unit = clean(r[5] || '');
+      const oldBalance = getBalanceFromRow(r);
+
+      let updated;
+      let newBalance;
+
+      if (mode === 'IN') {
+        const newIn = currentIn + qty;
+        newBalance = newIn - currentOut;
+        updated = [r[0], newIn, currentOut, newBalance, minAlert, unit, nowIso()];
+      } else {
+        if (qty > oldBalance) {
+          return `❌ Not enough stock: ${itemName} (Balance ${oldBalance} ${unit})`;
+        }
+        const newOut = currentOut + qty;
+        newBalance = currentIn - newOut;
+        updated = [r[0], currentIn, newOut, newBalance, minAlert, unit, nowIso()];
+      }
+
+      await updateRow(ref.rowIndex, updated);
+
+      await Promise.all([
+        runNonCriticalTask('Append log error:', () =>
+          appendLog([
+            nowIso(), mode, r[0], qty, oldBalance, newBalance, unit,
+            actorCtx.chatId, actorCtx.chatTitle, actorCtx.actor, role, note
+          ])
+        ),
+        runNonCriticalTask('Append report error:', () =>
+          appendReport(`${mode}_BULK`, `By=${actorCtx.actor}, Item=${r[0]}, Qty=${qty}, Before=${oldBalance}, After=${newBalance}, Note=${note}`)
+        )
+      ]);
+
+      if (mode === 'OUT') {
+        await checkAndSendLowStockAlert(actorCtx.chatId, updated);
+      }
+
+      return `✅ ${mode}: ${itemName} -> ${newBalance} ${unit}`;
+    });
+
+    results.push(result);
+  }
+
+  return results;
+}
+
+/**************** DAILY SUMMARY ****************/
+async function sendDailyLowStockSummariesIfDue() {
+  const now = new Date();
+  const parts = getTimeParts(APP_TIMEZONE, now);
+  if (parts.hour !== DAILY_REPORT_HOUR || parts.minute !== DAILY_REPORT_MINUTE) {
+    return;
+  }
+
+  const today = getLocalDateString(APP_TIMEZONE);
+  const [allowedChats, data] = await Promise.all([getAllowedChats(), getData()]);
+  const msg = buildLowStockSummaryMessage(data);
+
+  for (const chat of allowedChats) {
+    const chatId = String(chat[0] || '');
+    if (!chatId) continue;
+
+    if (lastDailySummaryDateByChat.get(chatId) === today) {
+      continue;
+    }
+
+    const setting = await getGroupSetting(chatId);
+    if (!setting.dailyReportEnabled) {
+      continue;
+    }
+
+    await sendLongMessage(chatId, msg);
+    lastDailySummaryDateByChat.set(chatId, today);
+  }
+}
+
+/**************** HEALTH ****************/
+function formatUptime(ms) {
+  const s = Math.floor(ms / 1000);
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return `${d}d ${h}h ${m}m ${sec}s`;
+}
+
+async function buildHealthMessage() {
+  const [data, logs, pending, processed, roles, allowedChats, groupSettings] = await Promise.all([
+    getData(),
+    getLogs(),
+    getPendingActions(),
+    getProcessedMessages(),
+    getRoles(),
+    getAllowedChats(),
+    getGroupSettingsRows()
+  ]);
+
+  const mem = process.memoryUsage();
+  return (
+    `🩺 Bot Health\n\n` +
+    `✅ Uptime: ${formatUptime(process.uptime() * 1000)}\n` +
+    `💾 RSS: ${Math.round(mem.rss / 1024 / 1024)} MB\n` +
+    `🧠 Heap Used: ${Math.round(mem.heapUsed / 1024 / 1024)} MB\n\n` +
+    `📦 Stock Rows: ${data.length}\n` +
+    `📝 Log Rows: ${logs.length}\n` +
+    `⏳ Pending Actions: ${pending.length}\n` +
+    `🧾 Processed Messages: ${processed.length}\n` +
+    `👥 Roles Rows: ${roles.length}\n` +
+    `💬 Allowed Chats: ${allowedChats.length}\n` +
+    `⚙️ Group Settings Rows: ${groupSettings.length}\n\n` +
+    `🗂 In-memory processed cache: ${processedMessageCache.size}\n` +
+    `🚦 Rate limit buckets: ${rateLimitCache.size}\n` +
+    `🔒 Active locks: ${itemLocks.size}`
+  );
+}
+
 /**************** COMMAND HANDLER ****************/
 async function handleCommand(msg) {
-  const chatId = msg.chat.id;
-  const text = clean(msg.text || '');
-  const parts = parsePipe(text);
+  const rawText = String(msg.text || '');
+  const lines = String(rawText).split(/\r?\n/).map(s => clean(s)).filter(Boolean);
+  const headerLine = lines[0] || '';
+  const parts = parsePipe(headerLine);
   const command = norm(parts[0]);
+
+  const chatId = msg.chat.id;
   const actorCtx = getActorContext(msg);
   const username = actorCtx.username;
   const actor = actorCtx.actor;
@@ -1047,8 +1717,21 @@ async function handleCommand(msg) {
   const [roleRows, allowedChatRows] = await Promise.all([getRoles(), getAllowedChats()]);
   const role = getUserRoleFromRows(username, roleRows);
   const isWriteCommand = WRITE_COMMANDS.has(command);
-  const processedMessageKey = isWriteCommand ? beginProcessedMessage(msg.message_id, chatId) : null;
+
+  if (isRateLimited(actorCtx, role, command)) {
+    return sendMessage(chatId, '⏳ Too many write commands. Please slow down a bit.');
+  }
+
+  let processedMessageKey = null;
   let processedMessageMarked = false;
+
+  if (isWriteCommand) {
+    const guard = await acquireWriteCommandGuard(msg.message_id, chatId);
+    if (!guard.ok) {
+      return sendMessage(chatId, 'ℹ️ This command was already processed.');
+    }
+    processedMessageKey = guard.key;
+  }
 
   async function markProcessedIfNeeded() {
     if (!processedMessageKey || processedMessageMarked) {
@@ -1056,938 +1739,1063 @@ async function handleCommand(msg) {
     }
 
     processedMessageMarked = true;
-    await finalizeProcessedMessage(msg.message_id, chatId, command, processedMessageKey);
+    await safeMarkProcessedMessage({
+      messageId: msg.message_id,
+      chatId,
+      command,
+      key: processedMessageKey
+    });
   }
 
   try {
     /************ GROUP WHITELIST CHECK ************/
     if (isGroupChat(msg) && !GROUP_BYPASS_COMMANDS.has(command)) {
       if (allowedChatRows.length === 0) {
-      return sendMessage(
-        chatId,
-        '⛔ This group is not allowed yet.\nSuper Admin must run /allowgroup in this group first.'
-      );
-    }
-
-      if (!isAllowedChatId(chatId, allowedChatRows)) {
-      return sendMessage(
-        chatId,
-        '⛔ This group is not in whitelist.\nPlease ask Super Admin to run /allowgroup here.'
-      );
-    }
-  }
-
-  /************ PERMISSION CHECK ************/
-  if (command !== '/start' && command !== '/help' && !canUseCommand(role, command)) {
-    const displayUser = msg?.from?.username ? `@${msg.from.username}` : actor;
-    return sendMessage(
-      chatId,
-      `⛔ Sorry ${displayUser}\nYou are not allowed to use ${command}\n👤 Your role: ${role}`
-    );
-  }
-
-  /*
-  Old duplicate idempotency block
-  if (isWriteCommand && !processedMessageKey) {
-      console.log(`ℹ️ Duplicate webhook ignored: message_id=${msg.message_id}, command=${command}`);
-      return sendMessage(chatId, 'ℹ️ This command was already processed.');
-    }
-  }
-
-  */
-
-  /************ IDEMPOTENCY CHECK FOR WRITE COMMANDS ************/
-  if (isWriteCommand && !processedMessageKey) {
-    console.log(`Duplicate webhook ignored: message_id=${msg.message_id}, command=${command}`);
-    return sendMessage(chatId, 'This command was already processed.');
-    }
-
-  /************ HELP / START ************/
-  if (command === '/start' || command === '/help') {
-    if (role === 'super_admin') {
-      return sendMessage(
-        chatId,
-        '🤖 Stock Bot\n\n' +
-        '👑 Super Admin:\n' +
-        '/addsuperadmin | username\n' +
-        '/removesuperadmin | username\n' +
-        '/addadmin | username\n' +
-        '/removeadmin | username\n' +
-        '/addmember | username\n' +
-        '/removemember | username\n' +
-        '/roles\n' +
-        '/myrole\n' +
-        '/allowgroup\n' +
-        '/disallowgroup\n' +
-        '/groups\n' +
-        '/additem | Item | MinAlert | Unit\n' +
-        '/deleteitem | Item\n' +
-        '/in | Item | Qty\n' +
-        '/out | Item | Qty\n' +
-        '/adjust | Item | NewBalance\n' +
-        '/search | keyword\n' +
-        '/stock | Item\n' +
-        '/allstock\n' +
-        '/alertstock\n' +
-        '/history | Item\n' +
-        '/today\n' +
-        '/report\n' +
-        '/exportsummary\n' +
-        '/exportlogs\n' +
-        '/confirm | CODE\n' +
-        '/cancel | CODE'
-      );
-    }
-
-    if (role === 'admin') {
-      return sendMessage(
-        chatId,
-        '🤖 Stock Bot\n\n' +
-        '🛠 Admin:\n' +
-        '/additem | Item | MinAlert | Unit\n' +
-        '/deleteitem | Item\n' +
-        '/exportsummary\n' +
-        '/exportlogs\n' +
-        '/in | Item | Qty\n' +
-        '/out | Item | Qty\n' +
-        '/search | keyword\n' +
-        '/stock | Item\n' +
-        '/allstock\n' +
-        '/alertstock\n' +
-        '/confirm | CODE\n' +
-        '/cancel | CODE\n' +
-        '/myrole'
-      );
-    }
-
-    if (role === 'member') {
-      return sendMessage(
-        chatId,
-        '🤖 Stock Bot\n\n' +
-        '👥 Member:\n' +
-        '/in | Item | Qty\n' +
-        '/out | Item | Qty\n' +
-        '/search | keyword\n' +
-        '/stock | Item\n' +
-        '/allstock\n' +
-        '/alertstock\n' +
-        '/confirm | CODE\n' +
-        '/cancel | CODE\n' +
-        '/myrole'
-      );
-    }
-
-    return sendMessage(
-      chatId,
-      '⛔ You are not registered to use this bot.\nPlease ask Super Admin to add your username.\n\n⚠️ Note: Telegram username is required.'
-    );
-  }
-
-  if (command === '/myrole') {
-    return sendMessage(
-      chatId,
-      `👤 Username: ${username ? '@' + username : 'no username'}\n🔐 Role: ${role}`
-    );
-  }
-
-  if (command === '/roles') {
-    const rows = roleRows;
-    let msgOut = '👥 Roles\n\n';
-
-    if (BOOTSTRAP_SUPER_ADMINS.length > 0) {
-      msgOut += '👑 Bootstrap Super Admins:\n';
-      for (const u of BOOTSTRAP_SUPER_ADMINS) {
-        msgOut += `- @${u}\n`;
-      }
-      msgOut += '\n';
-    }
-
-    if (rows.length === 0) {
-      msgOut += 'No sheet roles yet.';
-      return sendMessage(chatId, msgOut);
-    }
-
-    const groups = { super_admin: [], admin: [], member: [] };
-
-    for (const r of rows) {
-      const u = cleanUsername(r[0]);
-      const rr = norm(r[1]);
-      if (groups[rr]) groups[rr].push(u);
-    }
-
-    msgOut += '👑 Super Admin:\n' + (groups.super_admin.map(u => `- @${u}`).join('\n') || '-') + '\n\n';
-    msgOut += '🛠 Admin:\n' + (groups.admin.map(u => `- @${u}`).join('\n') || '-') + '\n\n';
-    msgOut += '👥 Member:\n' + (groups.member.map(u => `- @${u}`).join('\n') || '-');
-
-    return sendLongMessage(chatId, msgOut);
-  }
-
-  if (command === '/groups') {
-    const rows = allowedChatRows;
-    if (rows.length === 0) return sendMessage(chatId, '📭 No allowed groups yet');
-
-    let msgOut = '📋 Allowed Groups\n\n';
-    for (const r of rows) {
-      msgOut += `🆔 ${r[0]}\n🏷 ${clean(r[1] || '-')}\n🧩 ${clean(r[2] || '-')}\n\n`;
-    }
-    return sendLongMessage(chatId, msgOut.trim());
-  }
-
-  if (command === '/allowgroup') {
-    if (!isGroupChat(msg)) {
-      return sendMessage(chatId, '⚠️ /allowgroup can only be used inside a group');
-    }
-
-    const added = await addAllowedChat(chatId, actorCtx.chatTitle, actorCtx.chatType);
-    await appendReport('ALLOW_GROUP', `ChatId=${chatId}, Title=${actorCtx.chatTitle}, Added=${added}, By=${actor}`);
-    return sendMessage(
-      chatId,
-      added
-        ? `✅ Group allowed\n🆔 ${chatId}\n🏷 ${actorCtx.chatTitle}`
-        : `ℹ️ Group already allowed\n🆔 ${chatId}\n🏷 ${actorCtx.chatTitle}`
-    );
-  }
-
-  if (command === '/disallowgroup') {
-    if (!isGroupChat(msg)) {
-      return sendMessage(chatId, '⚠️ /disallowgroup can only be used inside a group');
-    }
-
-    const removed = await removeAllowedChat(chatId);
-    await appendReport('DISALLOW_GROUP', `ChatId=${chatId}, Title=${actorCtx.chatTitle}, Removed=${removed}, By=${actor}`);
-    return sendMessage(
-      chatId,
-      removed
-        ? `🗑️ Group removed from whitelist\n🆔 ${chatId}\n🏷 ${actorCtx.chatTitle}`
-        : 'ℹ️ This group was not in whitelist'
-    );
-  }
-
-  if (command === '/addsuperadmin' || command === '/addadmin' || command === '/addmember') {
-    if (parts.length < 2) return sendMessage(chatId, `⚠️ Usage:\n${command} | username`);
-
-    const target = cleanUsername(parts[1]);
-    const targetRole =
-      command === '/addsuperadmin' ? 'super_admin' :
-      command === '/addadmin' ? 'admin' : 'member';
-
-    if (!target) return sendMessage(chatId, '⚠️ Username required');
-
-    await upsertRole(target, targetRole);
-    await appendReport('ROLE_UPSERT', `By=${actor}, User=@${target}, Role=${targetRole}`);
-
-    return sendMessage(chatId, `✅ Role updated\n👤 @${target}\n🔐 ${targetRole}`);
-  }
-
-  if (command === '/removesuperadmin' || command === '/removeadmin' || command === '/removemember') {
-    if (parts.length < 2) return sendMessage(chatId, `⚠️ Usage:\n${command} | username`);
-
-    const target = cleanUsername(parts[1]);
-    const targetRole =
-      command === '/removesuperadmin' ? 'super_admin' :
-      command === '/removeadmin' ? 'admin' : 'member';
-
-    if (!target) return sendMessage(chatId, '⚠️ Username required');
-
-    if (BOOTSTRAP_SUPER_ADMINS.includes(target) && targetRole === 'super_admin') {
-      return sendMessage(chatId, '⚠️ Cannot remove bootstrap super admin from env');
-    }
-
-    const removed = await removeRole(target, targetRole);
-    await appendReport('ROLE_REMOVE', `By=${actor}, User=@${target}, Role=${targetRole}, Removed=${removed}`);
-
-    return sendMessage(
-      chatId,
-      removed
-        ? `🗑️ Role removed\n👤 @${target}\n🔐 ${targetRole}`
-        : `ℹ️ User not found in role list\n👤 @${target}\n🔐 ${targetRole}`
-    );
-  }
-
-  /*
-  if (command === '/confirm') {
-    if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/confirm | CODE');
-
-    const code = clean(parts[1]);
-    const pending = await findPendingActionByCode(code);
-
-    if (!pending) return sendMessage(chatId, '❌ Confirmation code not found');
-    if (pending.status !== 'pending') return sendMessage(chatId, `ℹ️ This request is already ${pending.status}`);
-    if (pending.username !== username) return sendMessage(chatId, '⛔ This confirmation code is not yours');
-    if (pending.chatId !== String(chatId)) return sendMessage(chatId, '⛔ This confirmation code belongs to another chat');
-    if (isExpired(pending.expiresAt)) {
-      await updatePendingActionStatus(pending.rowIndex, 'expired');
-      return sendMessage(chatId, '⌛ Confirmation code expired');
-    }
-
-    if (!canConfirmPending(role, pending.action)) {
-      return sendMessage(chatId, `⛔ You no longer have permission to confirm "${pending.action}"`);
-    }
-
-    try {
-      const resultMessage = await executeConfirmedAction(pending, msg, role, actorCtx);
-      await updatePendingActionStatus(pending.rowIndex, 'confirmed');
-      return sendMessage(chatId, `✅ Confirmed\nCode: ${code}\n\n${resultMessage}`);
-    } catch (err) {
-      await updatePendingActionStatus(pending.rowIndex, 'failed');
-      return sendMessage(chatId, `❌ Failed to execute confirmation\nCode: ${code}\nReason: ${err.message}`);
-    }
-  }
-
-  */
-
-  if (command === '/confirm') {
-    if (parts.length < 2) return sendMessage(chatId, 'Usage:\n/confirm | CODE');
-
-    if (parts.length < 2) return sendMessage(chatId, 'Usage:\n/confirm | CODE');
-    const code = clean(parts[1]);
-
-    return await withLock(`pending:${code}`, async () => {
-      const pending = await findPendingActionByCode(code);
-      if (!pending) return sendMessage(chatId, 'Confirmation code not found');
-      if (pending.status !== 'pending') return sendMessage(chatId, `This request is already ${pending.status}`);
-      if (pending.username !== username) return sendMessage(chatId, 'This confirmation code is not yours');
-      if (pending.chatId !== String(chatId)) return sendMessage(chatId, 'This confirmation code belongs to another chat');
-      if (isExpired(pending.expiresAt)) {
-        await updatePendingActionStatus(pending.rowIndex, 'expired');
-        await markProcessedIfNeeded();
-        return sendMessage(chatId, 'Confirmation code expired');
-      }
-
-      if (!canConfirmPending(role, pending.action)) {
-        return sendMessage(chatId, `You no longer have permission to confirm "${pending.action}"`);
-      }
-
-      try {
-        const resultMessage = await executeConfirmedAction(pending, msg, role, actorCtx);
-        await updatePendingActionStatus(pending.rowIndex, 'confirmed');
-        await markProcessedIfNeeded();
-        return sendMessage(chatId, `Confirmed\nCode: ${code}\n\n${resultMessage}`);
-      } catch (err) {
-        await runNonCriticalTask('PendingActions update error:', () =>
-          updatePendingActionStatus(pending.rowIndex, 'failed')
-        );
-        return sendMessage(chatId, `Failed to execute confirmation\nCode: ${code}\nReason: ${err.message}`);
-      }
-    });
-  }
-
-  /*
-  if (command === '/cancel') {
-    if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/cancel | CODE');
-
-    const code = clean(parts[1]);
-    const pending = await findPendingActionByCode(code);
-
-    if (!pending) return sendMessage(chatId, '❌ Confirmation code not found');
-    if (pending.status !== 'pending') return sendMessage(chatId, `ℹ️ This request is already ${pending.status}`);
-    if (pending.username !== username) return sendMessage(chatId, '⛔ This confirmation code is not yours');
-    if (pending.chatId !== String(chatId)) return sendMessage(chatId, '⛔ This confirmation code belongs to another chat');
-
-    await updatePendingActionStatus(pending.rowIndex, 'cancelled');
-    return sendMessage(chatId, `🛑 Cancelled\nCode: ${code}`);
-  }
-
-  */
-
-  if (command === '/cancel') {
-    if (parts.length < 2) return sendMessage(chatId, 'Usage:\n/cancel | CODE');
-
-    const code = clean(parts[1]);
-
-    return await withLock(`pending:${code}`, async () => {
-      const pending = await findPendingActionByCode(code);
-
-      if (!pending) return sendMessage(chatId, 'Confirmation code not found');
-      if (pending.status !== 'pending') return sendMessage(chatId, `This request is already ${pending.status}`);
-      if (pending.username !== username) return sendMessage(chatId, 'This confirmation code is not yours');
-      if (pending.chatId !== String(chatId)) return sendMessage(chatId, 'This confirmation code belongs to another chat');
-
-      await updatePendingActionStatus(pending.rowIndex, 'cancelled');
-      await markProcessedIfNeeded();
-      return sendMessage(chatId, `Cancelled\nCode: ${code}`);
-    });
-  }
-
-  if (command === '/additem') {
-    if (parts.length < 4) {
-      return sendMessage(chatId, '⚠️ Usage:\n/additem | Item Name | MinAlert | Unit');
-    }
-
-    const itemName = clean(parts[1]);
-    const minAlert = Number(parts[2]);
-    const unit = clean(parts[3]);
-
-    if (!isValidItemName(itemName)) {
-      return sendMessage(chatId, '⚠️ Invalid item name\n- Required\n- Max 100 chars\n- No newline\n- "|" is not allowed');
-    }
-    if (Number.isNaN(minAlert) || minAlert < 0) {
-      return sendMessage(chatId, '⚠️ MinAlert must be a valid number');
-    }
-    if (!unit) return sendMessage(chatId, '⚠️ Unit required');
-
-    return await withLock(`stock:${itemName}`, async () => {
-      const data = await getData();
-      const existing = findRowIndex(data, itemName);
-      if (existing !== -1) return sendMessage(chatId, `⚠️ Item already exists: ${itemName}`);
-
-      await appendRow([itemName, 0, 0, 0, minAlert, unit, nowIso()]);
-      await markProcessedIfNeeded();
-      await runNonCriticalTask('Append report error:', () =>
-        appendReport('ADD_ITEM', `By=${actor}, Item=${itemName}, MinAlert=${minAlert}, Unit=${unit}`)
-      );
-
-      return sendMessage(
-        chatId,
-        `✅ Item Added\n\n💊 Item: ${itemName}\n⚠️ MinAlert: ${minAlert}\n📦 Unit: ${unit}`
-      );
-    });
-  }
-
-  if (command === '/in') {
-    if (parts.length < 3) return sendMessage(chatId, '⚠️ Usage:\n/in | Item Name | Qty');
-
-    const itemName = clean(parts[1]);
-    const qty = Number(parts[2]);
-
-    if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
-    if (Number.isNaN(qty) || qty <= 0) return sendMessage(chatId, '⚠️ Qty must be greater than 0');
-
-    return await withLock(`stock:${itemName}`, async () => {
-      const data = await getData();
-      const row = findRowIndex(data, itemName);
-      if (row === -1) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
-
-      const r = data[row];
-      const currentIn = toNumber(r[1]);
-      const currentOut = toNumber(r[2]);
-      const minAlert = toNumber(r[4]);
-      const unit = clean(r[5] || '');
-      const oldBalance = getBalanceFromRow(r);
-
-      const newIn = currentIn + qty;
-      const newBalance = newIn - currentOut;
-
-      const updated = [r[0], newIn, currentOut, newBalance, minAlert, unit, nowIso()];
-      await updateRow(row, updated);
-      await markProcessedIfNeeded();
-
-      await Promise.all([
-        runNonCriticalTask('Append log error:', () =>
-          appendLog([
-            nowIso(), 'IN', r[0], qty, oldBalance, newBalance, unit,
-            actorCtx.chatId, actorCtx.chatTitle, actor, role, ''
-          ])
-        ),
-        runNonCriticalTask('Append report error:', () =>
-          appendReport('IN', `By=${actor}, Item=${r[0]}, Qty=${qty}, Before=${oldBalance}, After=${newBalance}`)
-        )
-      ]);
-
-      return sendMessage(
-        chatId,
-        `📥 Stock Updated\n\n💊 Item: ${r[0]}\n➕ Qty In: ${qty}\n📦 Balance: ${newBalance} ${unit}`
-      );
-    });
-  }
-
-  if (command === '/out') {
-    if (parts.length < 3) return sendMessage(chatId, '⚠️ Usage:\n/out | Item Name | Qty');
-
-    const itemName = clean(parts[1]);
-    const qty = Number(parts[2]);
-
-    if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
-    if (Number.isNaN(qty) || qty <= 0) return sendMessage(chatId, '⚠️ Qty must be greater than 0');
-
-    return await withLock(`stock:${itemName}`, async () => {
-      const data = await getData();
-      const row = findRowIndex(data, itemName);
-      if (row === -1) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
-
-      const r = data[row];
-      const currentIn = toNumber(r[1]);
-      const currentOut = toNumber(r[2]);
-      const minAlert = toNumber(r[4]);
-      const unit = clean(r[5] || '');
-      const oldBalance = getBalanceFromRow(r);
-
-      if (qty > oldBalance) {
-        return sendMessage(chatId, `❌ Not enough stock\n📦 Balance: ${oldBalance} ${unit}`);
-      }
-
-      const newOut = currentOut + qty;
-      const newBalance = currentIn - newOut;
-
-      const updated = [r[0], currentIn, newOut, newBalance, minAlert, unit, nowIso()];
-      await updateRow(row, updated);
-      await markProcessedIfNeeded();
-
-      await Promise.all([
-        runNonCriticalTask('Append log error:', () =>
-          appendLog([
-            nowIso(), 'OUT', r[0], qty, oldBalance, newBalance, unit,
-            actorCtx.chatId, actorCtx.chatTitle, actor, role, ''
-          ])
-        ),
-        runNonCriticalTask('Append report error:', () =>
-          appendReport('OUT', `By=${actor}, Item=${r[0]}, Qty=${qty}, Before=${oldBalance}, After=${newBalance}`)
-        )
-      ]);
-
-      await sendMessage(
-        chatId,
-        `📤 Stock Updated\n\n💊 Item: ${r[0]}\n➖ Qty Out: ${qty}\n📦 Balance: ${newBalance} ${unit}`
-      );
-
-      await checkAndSendLowStockAlert(chatId, updated);
-      return;
-    });
-  }
-
-  if (command === '/adjust') {
-    if (parts.length < 3) return sendMessage(chatId, '⚠️ Usage:\n/adjust | Item Name | NewBalance');
-
-    const itemName = clean(parts[1]);
-    const newBalance = Number(parts[2]);
-
-    if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
-    if (Number.isNaN(newBalance) || newBalance < 0) {
-      return sendMessage(chatId, '⚠️ NewBalance must be a valid number >= 0');
-    }
-
-    return await withLock(`stock:${itemName}`, async () => {
-      const data = await getData();
-      const row = findRowIndex(data, itemName);
-      if (row === -1) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
-
-      const r = data[row];
-      const currentIn = toNumber(r[1]);
-      const currentBalance = getBalanceFromRow(r);
-      const unit = clean(r[5] || '');
-
-      if (newBalance > currentIn) {
         return sendMessage(
           chatId,
-          `⚠️ NewBalance cannot be greater than total In (${currentIn}).\nCurrent design keeps In unchanged and recalculates Out.`
+          '⛔ This group is not allowed yet.\nSuper Admin must run /allowgroup in this group first.'
         );
       }
 
-      const pending = await createPendingAction(username, chatId, 'adjust', {
-        itemName,
-        newBalance
+      if (!isAllowedChatId(chatId, allowedChatRows)) {
+        return sendMessage(
+          chatId,
+          '⛔ This group is not in whitelist.\nPlease ask Super Admin to run /allowgroup here.'
+        );
+      }
+    }
+
+    /************ PERMISSION CHECK ************/
+    if (command !== '/start' && command !== '/help' && !canUseCommand(role, command)) {
+      const displayUser = msg?.from?.username ? `@${msg.from.username}` : actor;
+      return sendMessage(
+        chatId,
+        `⛔ Sorry ${displayUser}\nYou are not allowed to use ${command}\n👤 Your role: ${role}`
+      );
+    }
+
+    /************ HELP / START ************/
+    if (command === '/start' || command === '/help') {
+      if (role === 'super_admin') {
+        return sendLongMessage(
+          chatId,
+          '🤖 Stock Bot\n\n' +
+          '👑 Super Admin:\n' +
+          '/addsuperadmin | username\n' +
+          '/removesuperadmin | username\n' +
+          '/addadmin | username\n' +
+          '/removeadmin | username\n' +
+          '/addmember | username\n' +
+          '/removemember | username\n' +
+          '/roles\n' +
+          '/myrole\n' +
+          '/allowgroup\n' +
+          '/disallowgroup\n' +
+          '/groups\n' +
+          '/setdailyreport | on/off\n' +
+          '/setalerts | on/off\n' +
+          '/additem | Item | MinAlert | Unit\n' +
+          '/additemsbulk\nItem | MinAlert | Unit\n...\n' +
+          '/deleteitem | Item\n' +
+          '/in | Item | Qty | Optional Note\n' +
+          '/inbulk\nItem | Qty | Optional Note\n...\n' +
+          '/out | Item | Qty | Optional Note\n' +
+          '/outbulk\nItem | Qty | Optional Note\n...\n' +
+          '/adjust | Item | NewBalance\n' +
+          '/undo | Item\n' +
+          '/search | keyword\n' +
+          '/stock | Item\n' +
+          '/allstock\n' +
+          '/alertstock\n' +
+          '/history | Item\n' +
+          '/itemlogs | Item | limit\n' +
+          '/today\n' +
+          '/report\n' +
+          '/dashboard\n' +
+          '/audit | username\n' +
+          '/health\n' +
+          '/stats\n' +
+          '/exportsummary\n' +
+          '/exportlogs\n' +
+          '/confirm | CODE\n' +
+          '/cancel | CODE'
+        );
+      }
+
+      if (role === 'admin') {
+        return sendLongMessage(
+          chatId,
+          '🤖 Stock Bot\n\n' +
+          '🛠 Admin:\n' +
+          '/myrole\n' +
+          '/setdailyreport | on/off\n' +
+          '/setalerts | on/off\n' +
+          '/additem | Item | MinAlert | Unit\n' +
+          '/additemsbulk\nItem | MinAlert | Unit\n...\n' +
+          '/deleteitem | Item\n' +
+          '/in | Item | Qty | Optional Note\n' +
+          '/inbulk\nItem | Qty | Optional Note\n...\n' +
+          '/out | Item | Qty | Optional Note\n' +
+          '/outbulk\nItem | Qty | Optional Note\n...\n' +
+          '/undo | Item\n' +
+          '/search | keyword\n' +
+          '/stock | Item\n' +
+          '/allstock\n' +
+          '/alertstock\n' +
+          '/dashboard\n' +
+          '/itemlogs | Item | limit\n' +
+          '/health\n' +
+          '/stats\n' +
+          '/exportsummary\n' +
+          '/exportlogs\n' +
+          '/confirm | CODE\n' +
+          '/cancel | CODE'
+        );
+      }
+
+      if (role === 'member') {
+        return sendLongMessage(
+          chatId,
+          '🤖 Stock Bot\n\n' +
+          '👥 Member:\n' +
+          '/myrole\n' +
+          '/in | Item | Qty | Optional Note\n' +
+          '/out | Item | Qty | Optional Note\n' +
+          '/search | keyword\n' +
+          '/stock | Item\n' +
+          '/allstock\n' +
+          '/alertstock\n' +
+          '/dashboard\n' +
+          '/itemlogs | Item | limit\n' +
+          '/confirm | CODE\n' +
+          '/cancel | CODE'
+        );
+      }
+
+      return sendMessage(
+        chatId,
+        '⛔ You are not registered to use this bot.\nPlease ask Super Admin to add your username.\n\n⚠️ Telegram username is required.'
+      );
+    }
+
+    if (command === '/myrole') {
+      return sendMessage(
+        chatId,
+        `👤 Username: ${username ? '@' + username : 'no username'}\n🔐 Role: ${role}`
+      );
+    }
+
+    if (command === '/roles') {
+      const rows = roleRows;
+      let msgOut = '👥 Roles\n\n';
+
+      if (BOOTSTRAP_SUPER_ADMINS.length > 0) {
+        msgOut += '👑 Bootstrap Super Admins:\n';
+        for (const u of BOOTSTRAP_SUPER_ADMINS) {
+          msgOut += `- @${u}\n`;
+        }
+        msgOut += '\n';
+      }
+
+      if (rows.length === 0) {
+        msgOut += 'No sheet roles yet.';
+        return sendMessage(chatId, msgOut);
+      }
+
+      const groups = { super_admin: [], admin: [], member: [] };
+      for (const r of rows) {
+        const u = cleanUsername(r[0]);
+        const rr = norm(r[1]);
+        if (groups[rr]) groups[rr].push(u);
+      }
+
+      msgOut += '👑 Super Admin:\n' + (groups.super_admin.map(u => `- @${u}`).join('\n') || '-') + '\n\n';
+      msgOut += '🛠 Admin:\n' + (groups.admin.map(u => `- @${u}`).join('\n') || '-') + '\n\n';
+      msgOut += '👥 Member:\n' + (groups.member.map(u => `- @${u}`).join('\n') || '-');
+
+      return sendLongMessage(chatId, msgOut);
+    }
+
+    if (command === '/groups') {
+      const rows = allowedChatRows;
+      if (rows.length === 0) return sendMessage(chatId, '📭 No allowed groups yet');
+
+      let msgOut = '📋 Allowed Groups\n\n';
+      for (const r of rows) {
+        const setting = await getGroupSetting(r[0]);
+        msgOut += `🆔 ${r[0]}\n🏷 ${clean(r[1] || '-')}\n🧩 ${clean(r[2] || '-')}\n📣 DailyReport: ${setting.dailyReportEnabled}\n🚨 Alerts: ${setting.lowStockAlertsEnabled}\n\n`;
+      }
+      return sendLongMessage(chatId, msgOut.trim());
+    }
+
+    if (command === '/allowgroup') {
+      if (!isGroupChat(msg)) {
+        return sendMessage(chatId, '⚠️ /allowgroup can only be used inside a group');
+      }
+
+      const added = await addAllowedChat(chatId, actorCtx.chatTitle, actorCtx.chatType);
+      await upsertGroupSetting(chatId, actorCtx.chatTitle, {
+        dailyReportEnabled: true,
+        lowStockAlertsEnabled: true
+      });
+      await markProcessedIfNeeded();
+      await appendReport('ALLOW_GROUP', `ChatId=${chatId}, Title=${actorCtx.chatTitle}, Added=${added}, By=${actor}`);
+
+      return sendMessage(
+        chatId,
+        added
+          ? `✅ Group allowed\n🆔 ${chatId}\n🏷 ${actorCtx.chatTitle}`
+          : `ℹ️ Group already allowed\n🆔 ${chatId}\n🏷 ${actorCtx.chatTitle}`
+      );
+    }
+
+    if (command === '/disallowgroup') {
+      if (!isGroupChat(msg)) {
+        return sendMessage(chatId, '⚠️ /disallowgroup can only be used inside a group');
+      }
+
+      const removed = await removeAllowedChat(chatId);
+      await markProcessedIfNeeded();
+      await appendReport('DISALLOW_GROUP', `ChatId=${chatId}, Title=${actorCtx.chatTitle}, Removed=${removed}, By=${actor}`);
+
+      return sendMessage(
+        chatId,
+        removed
+          ? `🗑️ Group removed from whitelist\n🆔 ${chatId}\n🏷 ${actorCtx.chatTitle}`
+          : 'ℹ️ This group was not in whitelist'
+      );
+    }
+
+    if (command === '/setdailyreport') {
+      if (!isGroupChat(msg)) return sendMessage(chatId, '⚠️ This command can only be used in a group');
+      if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/setdailyreport | on/off');
+
+      const value = parseOnOff(parts[1]);
+      if (value === null) return sendMessage(chatId, '⚠️ Value must be on or off');
+
+      await upsertGroupSetting(chatId, actorCtx.chatTitle, { dailyReportEnabled: value });
+      await markProcessedIfNeeded();
+      await appendReport('SET_DAILY_REPORT', `By=${actor}, ChatId=${chatId}, Enabled=${value}`);
+
+      return sendMessage(chatId, `✅ Daily report is now ${value ? 'ON' : 'OFF'}`);
+    }
+
+    if (command === '/setalerts') {
+      if (!isGroupChat(msg)) return sendMessage(chatId, '⚠️ This command can only be used in a group');
+      if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/setalerts | on/off');
+
+      const value = parseOnOff(parts[1]);
+      if (value === null) return sendMessage(chatId, '⚠️ Value must be on or off');
+
+      await upsertGroupSetting(chatId, actorCtx.chatTitle, { lowStockAlertsEnabled: value });
+      await markProcessedIfNeeded();
+      await appendReport('SET_ALERTS', `By=${actor}, ChatId=${chatId}, Enabled=${value}`);
+
+      return sendMessage(chatId, `✅ Low-stock alerts are now ${value ? 'ON' : 'OFF'}`);
+    }
+
+    if (command === '/addsuperadmin' || command === '/addadmin' || command === '/addmember') {
+      if (parts.length < 2) return sendMessage(chatId, `⚠️ Usage:\n${command} | username`);
+
+      const target = cleanUsername(parts[1]);
+      const targetRole =
+        command === '/addsuperadmin' ? 'super_admin' :
+        command === '/addadmin' ? 'admin' : 'member';
+
+      if (!target) return sendMessage(chatId, '⚠️ Username required');
+
+      await upsertRole(target, targetRole);
+      await markProcessedIfNeeded();
+      await appendReport('ROLE_UPSERT', `By=${actor}, User=@${target}, Role=${targetRole}`);
+
+      return sendMessage(chatId, `✅ Role updated\n👤 @${target}\n🔐 ${targetRole}`);
+    }
+
+    if (command === '/removesuperadmin' || command === '/removeadmin' || command === '/removemember') {
+      if (parts.length < 2) return sendMessage(chatId, `⚠️ Usage:\n${command} | username`);
+
+      const target = cleanUsername(parts[1]);
+      const targetRole =
+        command === '/removesuperadmin' ? 'super_admin' :
+        command === '/removeadmin' ? 'admin' : 'member';
+
+      if (!target) return sendMessage(chatId, '⚠️ Username required');
+
+      if (BOOTSTRAP_SUPER_ADMINS.includes(target) && targetRole === 'super_admin') {
+        return sendMessage(chatId, '⚠️ Cannot remove bootstrap super admin from env');
+      }
+
+      const removed = await removeRole(target, targetRole);
+      await markProcessedIfNeeded();
+      await appendReport('ROLE_REMOVE', `By=${actor}, User=@${target}, Role=${targetRole}, Removed=${removed}`);
+
+      return sendMessage(
+        chatId,
+        removed
+          ? `🗑️ Role removed\n👤 @${target}\n🔐 ${targetRole}`
+          : `ℹ️ User not found in role list\n👤 @${target}\n🔐 ${targetRole}`
+      );
+    }
+
+    if (command === '/confirm') {
+      if (parts.length < 2) return sendMessage(chatId, 'Usage:\n/confirm | CODE');
+
+      const code = clean(parts[1]);
+
+      return await withLock(`pending:${code}`, async () => {
+        const pending = await findPendingActionByCode(code);
+        const validation = validatePendingActionOwnership(pending, username, chatId);
+
+        if (validation === 'expired') {
+          await updatePendingActionStatus(pending.rowIndex, 'expired');
+          await markProcessedIfNeeded();
+          return sendMessage(chatId, 'Confirmation code expired');
+        }
+
+        if (validation) {
+          return sendMessage(chatId, validation);
+        }
+
+        if (!canConfirmPending(role, pending.action)) {
+          return sendMessage(chatId, `You no longer have permission to confirm "${pending.action}"`);
+        }
+
+        try {
+          const resultMessage = await executeConfirmedAction(pending, msg, role, actorCtx);
+          await updatePendingActionStatus(pending.rowIndex, 'confirmed');
+          await markProcessedIfNeeded();
+          return sendMessage(chatId, `Confirmed\nCode: ${code}\n\n${resultMessage}`);
+        } catch (err) {
+          await runNonCriticalTask('PendingActions update error:', () =>
+            updatePendingActionStatus(pending.rowIndex, 'failed')
+          );
+          return sendMessage(chatId, `Failed to execute confirmation\nCode: ${code}\nReason: ${err.message}`);
+        }
+      });
+    }
+
+    if (command === '/cancel') {
+      if (parts.length < 2) return sendMessage(chatId, 'Usage:\n/cancel | CODE');
+
+      const code = clean(parts[1]);
+
+      return await withLock(`pending:${code}`, async () => {
+        const pending = await findPendingActionByCode(code);
+        const validation = validatePendingActionOwnership(pending, username, chatId);
+
+        if (validation === 'expired') {
+          await updatePendingActionStatus(pending.rowIndex, 'expired');
+          await markProcessedIfNeeded();
+          return sendMessage(chatId, 'Confirmation code expired');
+        }
+
+        if (validation) {
+          return sendMessage(chatId, validation);
+        }
+
+        await updatePendingActionStatus(pending.rowIndex, 'cancelled');
+        await markProcessedIfNeeded();
+        return sendMessage(chatId, `Cancelled\nCode: ${code}`);
+      });
+    }
+
+    if (command === '/additem') {
+      if (parts.length < 4) {
+        return sendMessage(chatId, '⚠️ Usage:\n/additem | Item Name | MinAlert | Unit');
+      }
+
+      const itemName = clean(parts[1]);
+      const minAlert = Number(parts[2]);
+      const unit = clean(parts[3]);
+
+      if (!isValidItemName(itemName)) {
+        return sendMessage(chatId, '⚠️ Invalid item name\n- Required\n- Max 100 chars\n- No newline\n- "|" is not allowed');
+      }
+      if (Number.isNaN(minAlert) || minAlert < 0) {
+        return sendMessage(chatId, '⚠️ MinAlert must be a valid number');
+      }
+      if (!isValidUnit(unit)) return sendMessage(chatId, '⚠️ Invalid Unit');
+
+      return await withLock(`stock:${itemName}`, async () => {
+        const data = await getData();
+        const existing = findRowIndex(data, itemName);
+        if (existing !== -1) return sendMessage(chatId, `⚠️ Item already exists: ${itemName}`);
+
+        await appendRow([itemName, 0, 0, 0, minAlert, unit, nowIso()]);
+        await markProcessedIfNeeded();
+        await runNonCriticalTask('Append report error:', () =>
+          appendReport('ADD_ITEM', `By=${actor}, Item=${itemName}, MinAlert=${minAlert}, Unit=${unit}`)
+        );
+
+        return sendMessage(
+          chatId,
+          `✅ Item Added\n\n💊 Item: ${itemName}\n⚠️ MinAlert: ${minAlert}\n📦 Unit: ${unit}`
+        );
+      });
+    }
+
+    if (command === '/additemsbulk') {
+      const entries = parseMultilineEntries(rawText);
+      if (entries.length === 0) {
+        return sendLongMessage(chatId, '⚠️ Usage:\n/additemsbulk\nItem | MinAlert | Unit\nItem2 | MinAlert | Unit');
+      }
+
+      const results = await processBulkAddItems(entries, actorCtx, role);
+      await markProcessedIfNeeded();
+      return sendLongMessage(chatId, `📦 Bulk Add Result\n\n${results.join('\n')}`);
+    }
+
+    if (command === '/inbulk') {
+      const entries = parseMultilineEntries(rawText);
+      if (entries.length === 0) {
+        return sendLongMessage(chatId, '⚠️ Usage:\n/inbulk\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note');
+      }
+
+      const results = await processBulkMovement(entries, 'IN', actorCtx, role);
+      await markProcessedIfNeeded();
+      return sendLongMessage(chatId, `📥 Bulk IN Result\n\n${results.join('\n')}`);
+    }
+
+    if (command === '/outbulk') {
+      const entries = parseMultilineEntries(rawText);
+      if (entries.length === 0) {
+        return sendLongMessage(chatId, '⚠️ Usage:\n/outbulk\nItem | Qty | Optional Note\nItem2 | Qty | Optional Note');
+      }
+
+      const results = await processBulkMovement(entries, 'OUT', actorCtx, role);
+      await markProcessedIfNeeded();
+      return sendLongMessage(chatId, `📤 Bulk OUT Result\n\n${results.join('\n')}`);
+    }
+
+    if (command === '/in') {
+      if (parts.length < 3) return sendMessage(chatId, '⚠️ Usage:\n/in | Item Name | Qty | Optional Note');
+
+      const itemName = clean(parts[1]);
+      const { qty, note } = parseQtyAndOptionalNote(parts);
+
+      if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
+      if (!assertValidQty(qty)) return sendMessage(chatId, '⚠️ Qty must be greater than 0');
+
+      return await withLock(`stock:${itemName}`, async () => {
+        const ref = await getStockRowByItemName(itemName);
+        if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+
+        const r = ref.row;
+        const currentIn = toNumber(r[1]);
+        const currentOut = toNumber(r[2]);
+        const minAlert = toNumber(r[4]);
+        const unit = clean(r[5] || '');
+        const oldBalance = getBalanceFromRow(r);
+
+        const newIn = currentIn + qty;
+        const newBalance = newIn - currentOut;
+
+        const updated = [r[0], newIn, currentOut, newBalance, minAlert, unit, nowIso()];
+        await updateRow(ref.rowIndex, updated);
+        await markProcessedIfNeeded();
+
+        await Promise.all([
+          runNonCriticalTask('Append log error:', () =>
+            appendLog([
+              nowIso(), 'IN', r[0], qty, oldBalance, newBalance, unit,
+              actorCtx.chatId, actorCtx.chatTitle, actor, role, note
+            ])
+          ),
+          runNonCriticalTask('Append report error:', () =>
+            appendReport('IN', `By=${actor}, Item=${r[0]}, Qty=${qty}, Before=${oldBalance}, After=${newBalance}, Note=${note}`)
+          )
+        ]);
+
+        return sendMessage(
+          chatId,
+          `📥 Stock Updated\n\n💊 Item: ${r[0]}\n➕ Qty In: ${qty}\n📦 Balance: ${newBalance} ${unit}` +
+          (note ? `\n📝 Note: ${note}` : '')
+        );
+      });
+    }
+
+    if (command === '/out') {
+      if (parts.length < 3) return sendMessage(chatId, '⚠️ Usage:\n/out | Item Name | Qty | Optional Note');
+
+      const itemName = clean(parts[1]);
+      const { qty, note } = parseQtyAndOptionalNote(parts);
+
+      if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
+      if (!assertValidQty(qty)) return sendMessage(chatId, '⚠️ Qty must be greater than 0');
+
+      return await withLock(`stock:${itemName}`, async () => {
+        const ref = await getStockRowByItemName(itemName);
+        if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+
+        const r = ref.row;
+        const currentIn = toNumber(r[1]);
+        const currentOut = toNumber(r[2]);
+        const minAlert = toNumber(r[4]);
+        const unit = clean(r[5] || '');
+        const oldBalance = getBalanceFromRow(r);
+
+        if (qty > oldBalance) {
+          return sendMessage(chatId, `❌ Not enough stock\n📦 Balance: ${oldBalance} ${unit}`);
+        }
+
+        const newOut = currentOut + qty;
+        const newBalance = currentIn - newOut;
+
+        const updated = [r[0], currentIn, newOut, newBalance, minAlert, unit, nowIso()];
+        await updateRow(ref.rowIndex, updated);
+        await markProcessedIfNeeded();
+
+        await Promise.all([
+          runNonCriticalTask('Append log error:', () =>
+            appendLog([
+              nowIso(), 'OUT', r[0], qty, oldBalance, newBalance, unit,
+              actorCtx.chatId, actorCtx.chatTitle, actor, role, note
+            ])
+          ),
+          runNonCriticalTask('Append report error:', () =>
+            appendReport('OUT', `By=${actor}, Item=${r[0]}, Qty=${qty}, Before=${oldBalance}, After=${newBalance}, Note=${note}`)
+          )
+        ]);
+
+        await sendMessage(
+          chatId,
+          `📤 Stock Updated\n\n💊 Item: ${r[0]}\n➖ Qty Out: ${qty}\n📦 Balance: ${newBalance} ${unit}` +
+          (note ? `\n📝 Note: ${note}` : '')
+        );
+
+        await checkAndSendLowStockAlert(chatId, updated);
+        return;
+      });
+    }
+
+    if (command === '/adjust') {
+      if (parts.length < 3) return sendMessage(chatId, '⚠️ Usage:\n/adjust | Item Name | NewBalance');
+
+      const itemName = clean(parts[1]);
+      const newBalance = Number(parts[2]);
+
+      if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
+      if (Number.isNaN(newBalance) || newBalance < 0) {
+        return sendMessage(chatId, '⚠️ NewBalance must be a valid number >= 0');
+      }
+
+      return await withLock(`stock:${itemName}`, async () => {
+        const ref = await getStockRowByItemName(itemName);
+        if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+
+        const r = ref.row;
+        const currentIn = toNumber(r[1]);
+        const currentBalance = getBalanceFromRow(r);
+        const unit = clean(r[5] || '');
+
+        if (newBalance > currentIn) {
+          return sendMessage(
+            chatId,
+            `⚠️ NewBalance cannot be greater than total In (${currentIn}).\nCurrent design keeps In unchanged and recalculates Out.`
+          );
+        }
+
+        const pending = await createPendingAction(username, chatId, 'adjust', {
+          itemName,
+          newBalance
+        });
+        await markProcessedIfNeeded();
+
+        return sendMessage(
+          chatId,
+          `⚠️ Confirm Adjust Required\n\n` +
+          `💊 Item: ${r[0]}\n` +
+          `📦 Current Balance: ${currentBalance} ${unit}\n` +
+          `✅ New Balance: ${newBalance} ${unit}\n\n` +
+          `🧾 Code: ${pending.code}\n` +
+          `⏳ Expires in ${CONFIRM_EXPIRE_MINUTES} minutes\n\n` +
+          `Confirm:\n/confirm | ${pending.code}\n\n` +
+          `Cancel:\n/cancel | ${pending.code}`
+        );
+      });
+    }
+
+    if (command === '/undo') {
+      if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/undo | Item Name');
+
+      const itemName = clean(parts[1]);
+      if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
+
+      try {
+        const result = await undoLastAction(itemName, actorCtx, role);
+        await markProcessedIfNeeded();
+        return sendMessage(chatId, result);
+      } catch (err) {
+        return sendMessage(chatId, `❌ Undo failed\nReason: ${err.message}`);
+      }
+    }
+
+    if (command === '/search') {
+      if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/search | keyword');
+
+      const keyword = norm(parts[1]);
+      if (!keyword) return sendMessage(chatId, '⚠️ Keyword required');
+
+      const data = await getData();
+      const matched = data.filter(r => norm(r[0]).includes(keyword));
+
+      if (matched.length === 0) {
+        return sendMessage(chatId, `📭 No items found for: ${parts[1]}`);
+      }
+
+      let msgOut = `🔎 Search Result: ${parts[1]}\n\n`;
+      for (const r of matched.slice(0, 50)) {
+        const item = clean(r[0] || '');
+        const balance = getBalanceFromRow(r);
+        const minAlert = toNumber(r[4]);
+        const unit = clean(r[5] || '');
+        const status = balance <= minAlert ? '🚨LOW' : '✅OK';
+        msgOut += `💊 ${item}\n📦 ${balance} ${unit} | ⚠️ Min: ${minAlert} | ${status}\n\n`;
+      }
+
+      if (matched.length > 50) {
+        msgOut += `...and ${matched.length - 50} more items`;
+      }
+
+      return sendLongMessage(chatId, msgOut.trim());
+    }
+
+    if (command === '/stock') {
+      if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/stock | Item Name');
+
+      const itemName = clean(parts[1]);
+      const ref = await getStockRowByItemName(itemName);
+      if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+
+      return sendMessage(chatId, `📊 Stock Info\n\n${buildStockMessage(ref.row)}`);
+    }
+
+    if (command === '/allstock') {
+      const data = await getData();
+      if (data.length === 0) return sendMessage(chatId, '📭 No stock data');
+
+      let msgOut = '📋 All Stock\n\n';
+      for (const r of data) {
+        const item = clean(r[0] || '');
+        const balance = getBalanceFromRow(r);
+        const minAlert = toNumber(r[4]);
+        const unit = clean(r[5] || '');
+        const status = balance <= minAlert ? ' 🚨LOW' : ' ✅OK';
+        msgOut += `💊 ${item}: ${balance} ${unit}${status}\n`;
+      }
+      return sendLongMessage(chatId, msgOut);
+    }
+
+    if (command === '/lowstock' || command === '/alertstock') {
+      const data = await getData();
+      if (data.length === 0) return sendMessage(chatId, '📭 No stock data');
+
+      const lowItems = data.filter(r => getBalanceFromRow(r) <= toNumber(r[4]));
+      if (lowItems.length === 0) return sendMessage(chatId, '✅ No low stock items');
+
+      let msgOut = '🚨 Low Stock Items\n\n';
+      for (const r of lowItems) {
+        const item = clean(r[0] || '');
+        const balance = getBalanceFromRow(r);
+        const minAlert = toNumber(r[4]);
+        const unit = clean(r[5] || '');
+        msgOut += `💊 ${item}: ${balance} ${unit} (Min: ${minAlert})\n`;
+      }
+      return sendLongMessage(chatId, msgOut);
+    }
+
+    if (command === '/setalert') {
+      if (parts.length < 3) return sendMessage(chatId, '⚠️ Usage:\n/setalert | Item Name | MinAlert');
+
+      const itemName = clean(parts[1]);
+      const minAlert = Number(parts[2]);
+
+      if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
+      if (Number.isNaN(minAlert) || minAlert < 0) {
+        return sendMessage(chatId, '⚠️ MinAlert must be a valid number');
+      }
+
+      return await withLock(`stock:${itemName}`, async () => {
+        const ref = await getStockRowByItemName(itemName);
+        if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+
+        const r = ref.row;
+        const currentIn = toNumber(r[1]);
+        const currentOut = toNumber(r[2]);
+        const balance = getBalanceFromRow(r);
+        const unit = clean(r[5] || '');
+
+        await updateRow(ref.rowIndex, [r[0], currentIn, currentOut, balance, minAlert, unit, nowIso()]);
+        await markProcessedIfNeeded();
+        await runNonCriticalTask('Append report error:', () =>
+          appendReport('SET_ALERT', `By=${actor}, Item=${r[0]}, MinAlert=${minAlert}`)
+        );
+
+        return sendMessage(
+          chatId,
+          `✅ MinAlert Updated\n\n💊 Item: ${r[0]}\n⚠️ New MinAlert: ${minAlert}`
+        );
+      });
+    }
+
+    if (command === '/setunit') {
+      if (parts.length < 3) return sendMessage(chatId, '⚠️ Usage:\n/setunit | Item Name | Unit');
+
+      const itemName = clean(parts[1]);
+      const unit = clean(parts[2]);
+
+      if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
+      if (!isValidUnit(unit)) return sendMessage(chatId, '⚠️ Invalid Unit');
+
+      return await withLock(`stock:${itemName}`, async () => {
+        const ref = await getStockRowByItemName(itemName);
+        if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+
+        const r = ref.row;
+        await updateRow(ref.rowIndex, [r[0], toNumber(r[1]), toNumber(r[2]), getBalanceFromRow(r), toNumber(r[4]), unit, nowIso()]);
+        await markProcessedIfNeeded();
+        await runNonCriticalTask('Append report error:', () =>
+          appendReport('SET_UNIT', `By=${actor}, Item=${r[0]}, Unit=${unit}`)
+        );
+
+        return sendMessage(
+          chatId,
+          `✅ Unit Updated\n\n💊 Item: ${r[0]}\n📦 New Unit: ${unit}`
+        );
+      });
+    }
+
+    if (command === '/renameitem') {
+      if (parts.length < 3) return sendMessage(chatId, '⚠️ Usage:\n/renameitem | Old Name | New Name');
+
+      const oldName = clean(parts[1]);
+      const newName = clean(parts[2]);
+
+      if (!isValidItemName(oldName) || !isValidItemName(newName)) {
+        return sendMessage(chatId, '⚠️ Invalid old name or new name');
+      }
+
+      if (norm(oldName) === norm(newName)) {
+        return sendMessage(chatId, '⚠️ Old name and new name are the same');
+      }
+
+      const lockKeys = [`stock:${oldName}`, `stock:${newName}`].sort();
+
+      return await withLock(lockKeys[0], async () => {
+        return await withLock(lockKeys[1], async () => {
+          const data = await getData();
+
+          const oldRow = findRowIndex(data, oldName);
+          if (oldRow === -1) return sendMessage(chatId, `❌ Item not found: ${oldName}`);
+
+          const existingNew = findRowIndex(data, newName);
+          if (existingNew !== -1) return sendMessage(chatId, `⚠️ Item already exists: ${newName}`);
+
+          const r = data[oldRow];
+          await updateRow(oldRow, [
+            newName,
+            toNumber(r[1]),
+            toNumber(r[2]),
+            getBalanceFromRow(r),
+            toNumber(r[4]),
+            clean(r[5] || ''),
+            nowIso()
+          ]);
+
+          await markProcessedIfNeeded();
+          await runNonCriticalTask('Append report error:', () =>
+            appendReport('RENAME_ITEM', `By=${actor}, ${oldName} -> ${newName}`)
+          );
+          return sendMessage(chatId, `✅ Item Renamed\n\n📝 Old: ${oldName}\n✨ New: ${newName}`);
+        });
+      });
+    }
+
+    if (command === '/deleteitem') {
+      if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/deleteitem | Item Name');
+
+      const itemName = clean(parts[1]);
+      if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
+
+      const data = await getData();
+      const row = findRowIndex(data, itemName);
+      if (row === -1) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+
+      const pending = await createPendingAction(username, chatId, 'deleteitem', {
+        itemName
       });
       await markProcessedIfNeeded();
 
       return sendMessage(
         chatId,
-        `⚠️ Confirm Adjust Required\n\n` +
-        `💊 Item: ${r[0]}\n` +
-        `📦 Current Balance: ${currentBalance} ${unit}\n` +
-        `✅ New Balance: ${newBalance} ${unit}\n\n` +
+        `⚠️ Confirm Delete Required\n\n` +
+        `💊 Item: ${itemName}\n\n` +
         `🧾 Code: ${pending.code}\n` +
         `⏳ Expires in ${CONFIRM_EXPIRE_MINUTES} minutes\n\n` +
         `Confirm:\n/confirm | ${pending.code}\n\n` +
         `Cancel:\n/cancel | ${pending.code}`
       );
-    });
-  }
-
-  if (command === '/search') {
-    if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/search | keyword');
-
-    const keyword = norm(parts[1]);
-    if (!keyword) return sendMessage(chatId, '⚠️ Keyword required');
-
-    const data = await getData();
-    const matched = data.filter(r => norm(r[0]).includes(keyword));
-
-    if (matched.length === 0) {
-      return sendMessage(chatId, `📭 No items found for: ${parts[1]}`);
     }
 
-    let msgOut = `🔎 Search Result: ${parts[1]}\n\n`;
-    for (const r of matched.slice(0, 50)) {
-      const item = clean(r[0] || '');
-      const balance = getBalanceFromRow(r);
-      const minAlert = toNumber(r[4]);
-      const unit = clean(r[5] || '');
-      const status = balance <= minAlert ? '🚨LOW' : '✅OK';
-      msgOut += `💊 ${item}\n📦 ${balance} ${unit} | ⚠️ Min: ${minAlert} | ${status}\n\n`;
+    if (command === '/history') {
+      if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/history | Item Name');
+
+      const itemName = clean(parts[1]);
+      const logs = await getLogs();
+      const filtered = logs.filter(r => norm(r[2]) === norm(itemName));
+
+      if (filtered.length === 0) {
+        return sendMessage(chatId, `📭 No history found for: ${itemName}`);
+      }
+
+      const recent = filtered.slice(-20);
+      let msgOut = `📜 History: ${itemName}\n\n`;
+
+      for (const r of recent) {
+        const ts = clean(r[0] || '');
+        const type = clean(r[1] || '');
+        const qty = toNumber(r[3]);
+        const beforeBal = toNumber(r[4]);
+        const afterBal = toNumber(r[5]);
+        const unit = clean(r[6] || '');
+        const user = clean(r[9] || '');
+        const roleUsed = clean(r[10] || '');
+        const note = clean(r[11] || '');
+
+        const emoji =
+          type === 'IN' ? '📥' :
+          type === 'OUT' ? '📤' :
+          type === 'ADJUST' ? '🛠' :
+          type === 'UNDO' ? '↩️' : '📝';
+
+        msgOut += `${emoji} ${type} | Before: ${beforeBal} | After: ${afterBal} ${unit}\n`;
+        if (qty) msgOut += `🔢 Qty: ${qty}\n`;
+        msgOut += `🕒 ${ts}`;
+        if (user) msgOut += ` | 👤 ${user}`;
+        if (roleUsed) msgOut += ` | 🔐 ${roleUsed}`;
+        if (note) msgOut += `\n📝 ${note}`;
+        msgOut += '\n\n';
+      }
+
+      return sendLongMessage(chatId, msgOut.trim());
     }
 
-    if (matched.length > 50) {
-      msgOut += `...and ${matched.length - 50} more items`;
+    if (command === '/itemlogs') {
+      if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/itemlogs | Item Name | limit');
+
+      const itemName = clean(parts[1]);
+      const limit = parts.length >= 3 ? Math.max(1, Math.min(100, Number(parts[2]) || 20)) : 20;
+
+      const logs = await getLogs();
+      const filtered = logs.filter(r => norm(r[2]) === norm(itemName));
+
+      if (filtered.length === 0) {
+        return sendMessage(chatId, `📭 No logs found for: ${itemName}`);
+      }
+
+      const recent = filtered.slice(-limit);
+      let msgOut = `📜 Item Logs: ${itemName} (last ${recent.length})\n\n`;
+
+      for (const r of recent) {
+        const ts = clean(r[0] || '');
+        const type = clean(r[1] || '');
+        const qty = toNumber(r[3]);
+        const beforeBal = toNumber(r[4]);
+        const afterBal = toNumber(r[5]);
+        const unit = clean(r[6] || '');
+        const user = clean(r[9] || '');
+        const note = clean(r[11] || '');
+
+        msgOut += `🕒 ${ts}\n`;
+        msgOut += `🔁 ${type} | Qty=${qty} | ${beforeBal} -> ${afterBal} ${unit}\n`;
+        if (user) msgOut += `👤 ${user}\n`;
+        if (note) msgOut += `📝 ${note}\n`;
+        msgOut += '\n';
+      }
+
+      return sendLongMessage(chatId, msgOut.trim());
     }
 
-    return sendLongMessage(chatId, msgOut.trim());
-  }
+    if (command === '/today') {
+      const logs = await getLogs();
+      const summary = summarizeTodayLogs(logs, APP_TIMEZONE);
 
-  if (command === '/stock') {
-    if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/stock | Item Name');
+      const totalTx = summary.inCount + summary.outCount + summary.adjustCount + summary.undoCount;
+      if (totalTx === 0) {
+        return sendMessage(chatId, `📭 No transactions today (${summary.today}, ${APP_TIMEZONE})`);
+      }
 
-    const itemName = clean(parts[1]);
-    const data = await getData();
-    const row = findRowIndex(data, itemName);
-    if (row === -1) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+      const msgOut =
+        `📅 Today Summary (${summary.today}, ${APP_TIMEZONE})\n\n` +
+        `📥 IN Transactions: ${summary.inCount}\n` +
+        `➕ Total IN Qty: ${summary.inQty}\n\n` +
+        `📤 OUT Transactions: ${summary.outCount}\n` +
+        `➖ Total OUT Qty: ${summary.outQty}\n\n` +
+        `🛠 Adjust Transactions: ${summary.adjustCount}\n` +
+        `↩️ Undo Transactions: ${summary.undoCount}\n\n` +
+        `🧾 Total Transactions: ${totalTx}`;
 
-    const r = data[row];
-    const currentIn = toNumber(r[1]);
-    const currentOut = toNumber(r[2]);
-    const balance = getBalanceFromRow(r);
-    const minAlert = toNumber(r[4]);
-    const unit = clean(r[5] || '');
-    const lowMark = balance <= minAlert ? '\n🚨 Status: LOW STOCK' : '\n✅ Status: OK';
-
-    return sendMessage(
-      chatId,
-      `📊 Stock Info\n\n` +
-      `💊 Item: ${r[0]}\n` +
-      `📥 In: ${currentIn}\n` +
-      `📤 Out: ${currentOut}\n` +
-      `📦 Balance: ${balance} ${unit}\n` +
-      `⚠️ MinAlert: ${minAlert}` +
-      lowMark
-    );
-  }
-
-  if (command === '/allstock') {
-    const data = await getData();
-    if (data.length === 0) return sendMessage(chatId, '📭 No stock data');
-
-    let msgOut = '📋 All Stock\n\n';
-    for (const r of data) {
-      const item = clean(r[0] || '');
-      const balance = getBalanceFromRow(r);
-      const minAlert = toNumber(r[4]);
-      const unit = clean(r[5] || '');
-      const status = balance <= minAlert ? ' 🚨LOW' : ' ✅OK';
-      msgOut += `💊 ${item}: ${balance} ${unit}${status}\n`;
-    }
-    return sendLongMessage(chatId, msgOut);
-  }
-
-  if (command === '/lowstock' || command === '/alertstock') {
-    const data = await getData();
-    if (data.length === 0) return sendMessage(chatId, '📭 No stock data');
-
-    const lowItems = data.filter(r => getBalanceFromRow(r) <= toNumber(r[4]));
-    if (lowItems.length === 0) return sendMessage(chatId, '✅ No low stock items');
-
-    let msgOut = '🚨 Low Stock Items\n\n';
-    for (const r of lowItems) {
-      const item = clean(r[0] || '');
-      const balance = getBalanceFromRow(r);
-      const minAlert = toNumber(r[4]);
-      const unit = clean(r[5] || '');
-      msgOut += `💊 ${item}: ${balance} ${unit} (Min: ${minAlert})\n`;
-    }
-    return sendLongMessage(chatId, msgOut);
-  }
-
-  if (command === '/setalert') {
-    if (parts.length < 3) return sendMessage(chatId, '⚠️ Usage:\n/setalert | Item Name | MinAlert');
-
-    const itemName = clean(parts[1]);
-    const minAlert = Number(parts[2]);
-
-    if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
-    if (Number.isNaN(minAlert) || minAlert < 0) {
-      return sendMessage(chatId, '⚠️ MinAlert must be a valid number');
+      return sendMessage(chatId, msgOut);
     }
 
-    return await withLock(`stock:${itemName}`, async () => {
+    if (command === '/report') {
       const data = await getData();
-      const row = findRowIndex(data, itemName);
-      if (row === -1) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
+      const summary = summarizeStock(data);
 
-      const r = data[row];
-      const currentIn = toNumber(r[1]);
-      const currentOut = toNumber(r[2]);
-      const balance = getBalanceFromRow(r);
-      const unit = clean(r[5] || '');
+      let msgOut =
+        `📊 Stock Report\n\n` +
+        `📦 Total Items: ${summary.totalItems}\n` +
+        `🚨 Low Stock Items: ${summary.lowStockCount}\n` +
+        `🔢 Total Balance Qty: ${summary.totalBalance}\n\n`;
 
-      await updateRow(row, [r[0], currentIn, currentOut, balance, minAlert, unit, nowIso()]);
-      await markProcessedIfNeeded();
-      await runNonCriticalTask('Append report error:', () =>
-        appendReport('SET_ALERT', `By=${actor}, Item=${r[0]}, MinAlert=${minAlert}`)
+      const lowItems = data.filter(r => getBalanceFromRow(r) <= toNumber(r[4]));
+      if (lowItems.length > 0) {
+        msgOut += `🚨 Low Stock List:\n`;
+        for (const r of lowItems) {
+          msgOut += `💊 ${r[0]}: ${getBalanceFromRow(r)} ${clean(r[5] || '')} (Min: ${toNumber(r[4])})\n`;
+        }
+      } else {
+        msgOut += `✅ No low stock items`;
+      }
+
+      await appendReport(
+        'REPORT_VIEW',
+        `By=${actor}, TotalItems=${summary.totalItems}, LowStock=${summary.lowStockCount}, TotalBalance=${summary.totalBalance}`
       );
 
-      return sendMessage(
-        chatId,
-        `✅ MinAlert Updated\n\n💊 Item: ${r[0]}\n⚠️ New MinAlert: ${minAlert}`
-      );
-    });
-  }
-
-  if (command === '/setunit') {
-    if (parts.length < 3) return sendMessage(chatId, '⚠️ Usage:\n/setunit | Item Name | Unit');
-
-    const itemName = clean(parts[1]);
-    const unit = clean(parts[2]);
-
-    if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
-    if (!unit) return sendMessage(chatId, '⚠️ Unit required');
-
-    return await withLock(`stock:${itemName}`, async () => {
-      const data = await getData();
-      const row = findRowIndex(data, itemName);
-      if (row === -1) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
-
-      const r = data[row];
-      await updateRow(row, [r[0], toNumber(r[1]), toNumber(r[2]), getBalanceFromRow(r), toNumber(r[4]), unit, nowIso()]);
-      await markProcessedIfNeeded();
-      await runNonCriticalTask('Append report error:', () =>
-        appendReport('SET_UNIT', `By=${actor}, Item=${r[0]}, Unit=${unit}`)
-      );
-
-      return sendMessage(
-        chatId,
-        `✅ Unit Updated\n\n💊 Item: ${r[0]}\n📦 New Unit: ${unit}`
-      );
-    });
-  }
-
-  if (command === '/renameitem') {
-    if (parts.length < 3) return sendMessage(chatId, '⚠️ Usage:\n/renameitem | Old Name | New Name');
-
-    const oldName = clean(parts[1]);
-    const newName = clean(parts[2]);
-
-    if (!isValidItemName(oldName) || !isValidItemName(newName)) {
-      return sendMessage(chatId, '⚠️ Invalid old name or new name');
+      return sendLongMessage(chatId, msgOut);
     }
 
-    return await withLock(`stock:${oldName}`, async () => {
-      return await withLock(`stock:${newName}`, async () => {
-        const data = await getData();
+    if (command === '/dashboard') {
+      const [data, logs] = await Promise.all([getData(), getLogs()]);
+      const stockSummary = summarizeStock(data);
+      const todaySummary = summarizeTodayLogs(logs, APP_TIMEZONE);
 
-        const oldRow = findRowIndex(data, oldName);
-        if (oldRow === -1) return sendMessage(chatId, `❌ Item not found: ${oldName}`);
+      const lowItems = data
+        .filter(r => getBalanceFromRow(r) <= toNumber(r[4]))
+        .slice(0, 10);
 
-        const existingNew = findRowIndex(data, newName);
-        if (existingNew !== -1) return sendMessage(chatId, `⚠️ Item already exists: ${newName}`);
+      let msgOut =
+        `📊 Dashboard\n\n` +
+        `📦 Total Items: ${stockSummary.totalItems}\n` +
+        `🚨 Low Stock Items: ${stockSummary.lowStockCount}\n` +
+        `🔢 Total Balance Qty: ${stockSummary.totalBalance}\n\n` +
+        `📅 Today (${todaySummary.today}, ${APP_TIMEZONE})\n` +
+        `📥 IN: ${todaySummary.inCount} tx | Qty ${todaySummary.inQty}\n` +
+        `📤 OUT: ${todaySummary.outCount} tx | Qty ${todaySummary.outQty}\n` +
+        `🛠 ADJUST: ${todaySummary.adjustCount}\n` +
+        `↩️ UNDO: ${todaySummary.undoCount}\n\n`;
 
-        const r = data[oldRow];
-        await updateRow(oldRow, [
-          newName,
+      if (lowItems.length > 0) {
+        msgOut += '🚨 Top Low Stock:\n';
+        for (const r of lowItems) {
+          msgOut += `💊 ${clean(r[0] || '')}: ${getBalanceFromRow(r)} ${clean(r[5] || '')} (Min ${toNumber(r[4])})\n`;
+        }
+      } else {
+        msgOut += '✅ No low stock items';
+      }
+
+      return sendLongMessage(chatId, msgOut);
+    }
+
+    if (command === '/audit') {
+      if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/audit | username');
+
+      const target = cleanUsername(parts[1]);
+      if (!target) return sendMessage(chatId, '⚠️ Username required');
+
+      const logs = await getLogs();
+      const matched = logs.filter(r => cleanUsername(r[9]) === target);
+
+      if (matched.length === 0) {
+        return sendMessage(chatId, `📭 No activity found for @${target}`);
+      }
+
+      const recent = matched.slice(-30);
+      let msgOut = `🕵️ Audit: @${target}\n\n`;
+
+      for (const r of recent) {
+        const ts = clean(r[0] || '');
+        const type = clean(r[1] || '');
+        const item = clean(r[2] || '');
+        const qty = toNumber(r[3]);
+        const beforeBal = toNumber(r[4]);
+        const afterBal = toNumber(r[5]);
+        const unit = clean(r[6] || '');
+        const roleUsed = clean(r[10] || '');
+        const note = clean(r[11] || '');
+
+        msgOut += `🕒 ${ts}\n`;
+        msgOut += `🔁 ${type} | 💊 ${item} | Qty=${qty} | ${beforeBal} -> ${afterBal} ${unit}`;
+        if (roleUsed) msgOut += ` | 🔐 ${roleUsed}`;
+        if (note) msgOut += `\n📝 ${note}`;
+        msgOut += '\n\n';
+      }
+
+      return sendLongMessage(chatId, msgOut.trim());
+    }
+
+    if (command === '/health' || command === '/stats') {
+      const healthMsg = await buildHealthMessage();
+      return sendMessage(chatId, healthMsg);
+    }
+
+    if (command === '/exportsummary') {
+      const data = await getData();
+      if (data.length === 0) return sendMessage(chatId, '📭 No stock data to export');
+
+      const rows = [['Item', 'In', 'Out', 'Balance', 'MinAlert', 'Unit', 'UpdatedAt']];
+      for (const r of data) {
+        rows.push([
+          clean(r[0] || ''),
           toNumber(r[1]),
           toNumber(r[2]),
           getBalanceFromRow(r),
           toNumber(r[4]),
           clean(r[5] || ''),
-          nowIso()
+          clean(r[6] || '')
         ]);
-
-        await markProcessedIfNeeded();
-        await runNonCriticalTask('Append report error:', () =>
-          appendReport('RENAME_ITEM', `By=${actor}, ${oldName} -> ${newName}`)
-        );
-        return sendMessage(chatId, `✅ Item Renamed\n\n📝 Old: ${oldName}\n✨ New: ${newName}`);
-      });
-    });
-  }
-
-  if (command === '/deleteitem') {
-    if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/deleteitem | Item Name');
-
-    const itemName = clean(parts[1]);
-    if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
-
-    const data = await getData();
-    const row = findRowIndex(data, itemName);
-    if (row === -1) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
-
-    const pending = await createPendingAction(username, chatId, 'deleteitem', {
-      itemName
-    });
-    await markProcessedIfNeeded();
-
-    return sendMessage(
-      chatId,
-      `⚠️ Confirm Delete Required\n\n` +
-      `💊 Item: ${itemName}\n\n` +
-      `🧾 Code: ${pending.code}\n` +
-      `⏳ Expires in ${CONFIRM_EXPIRE_MINUTES} minutes\n\n` +
-      `Confirm:\n/confirm | ${pending.code}\n\n` +
-      `Cancel:\n/cancel | ${pending.code}`
-    );
-  }
-
-  if (command === '/history') {
-    if (parts.length < 2) return sendMessage(chatId, '⚠️ Usage:\n/history | Item Name');
-
-    const itemName = clean(parts[1]);
-    const logs = await getLogs();
-    const filtered = logs.filter(r => norm(r[2]) === norm(itemName));
-
-    if (filtered.length === 0) {
-      return sendMessage(chatId, `📭 No history found for: ${itemName}`);
-    }
-
-    const recent = filtered.slice(-20);
-    let msgOut = `📜 History: ${itemName}\n\n`;
-
-    for (const r of recent) {
-      const ts = clean(r[0] || '');
-      const type = clean(r[1] || '');
-      const qty = toNumber(r[3]);
-      const beforeBal = toNumber(r[4]);
-      const afterBal = toNumber(r[5]);
-      const unit = clean(r[6] || '');
-      const user = clean(r[9] || '');
-      const roleUsed = clean(r[10] || '');
-      const note = clean(r[11] || '');
-
-      const emoji =
-        type === 'IN' ? '📥' :
-        type === 'OUT' ? '📤' :
-        type === 'ADJUST' ? '🛠' : '📝';
-
-      msgOut += `${emoji} ${type} | Before: ${beforeBal} | After: ${afterBal} ${unit}\n`;
-      if (qty) msgOut += `🔢 Qty: ${qty}\n`;
-      msgOut += `🕒 ${ts}`;
-      if (user) msgOut += ` | 👤 ${user}`;
-      if (roleUsed) msgOut += ` | 🔐 ${roleUsed}`;
-      if (note) msgOut += `\n📝 ${note}`;
-      msgOut += '\n\n';
-    }
-
-    return sendLongMessage(chatId, msgOut.trim());
-  }
-
-  if (command === '/today') {
-    const logs = await getLogs();
-    const today = getLocalDateString(APP_TIMEZONE);
-    const todayLogs = logs.filter(r => {
-      const ts = clean(r[0] || '');
-      if (!ts) return false;
-      const d = new Date(ts);
-      if (Number.isNaN(d.getTime())) return false;
-      return getLocalDateStringFromDate(d, APP_TIMEZONE) === today;
-    });
-
-    if (todayLogs.length === 0) {
-      return sendMessage(chatId, `📭 No transactions today (${today}, ${APP_TIMEZONE})`);
-    }
-
-    let inCount = 0;
-    let outCount = 0;
-    let adjustCount = 0;
-    let inQty = 0;
-    let outQty = 0;
-
-    for (const r of todayLogs) {
-      const type = clean(r[1] || '');
-      const qty = toNumber(r[3]);
-
-      if (type === 'IN') {
-        inCount += 1;
-        inQty += qty;
-      } else if (type === 'OUT') {
-        outCount += 1;
-        outQty += qty;
-      } else if (type === 'ADJUST') {
-        adjustCount += 1;
       }
+
+      const csv = rows.map(row => row.map(escapeCsv).join(',')).join('\n');
+      await appendReport('EXPORT_SUMMARY', `By=${actor}, Exported ${data.length} items`);
+
+      return sendDocument(chatId, `stock-summary-${getLocalDateString(APP_TIMEZONE)}.csv`, csv);
     }
 
-    const msgOut =
-      `📅 Today Summary (${today}, ${APP_TIMEZONE})\n\n` +
-      `📥 IN Transactions: ${inCount}\n` +
-      `➕ Total IN Qty: ${inQty}\n\n` +
-      `📤 OUT Transactions: ${outCount}\n` +
-      `➖ Total OUT Qty: ${outQty}\n\n` +
-      `🛠 Adjust Transactions: ${adjustCount}\n\n` +
-      `🧾 Total Transactions: ${todayLogs.length}`;
+    if (command === '/exportlogs') {
+      const logs = await getLogs();
+      if (logs.length === 0) return sendMessage(chatId, '📭 No logs to export');
 
-    return sendMessage(chatId, msgOut);
-  }
+      const rows = [[
+        'Timestamp', 'Type', 'Item', 'Qty', 'BalanceBefore', 'BalanceAfter',
+        'Unit', 'ChatId', 'ChatTitle', 'Username', 'Role', 'Note'
+      ]];
 
-  if (command === '/report') {
-    const data = await getData();
-    const summary = summarizeStock(data);
-
-    let msgOut =
-      `📊 Stock Report\n\n` +
-      `📦 Total Items: ${summary.totalItems}\n` +
-      `🚨 Low Stock Items: ${summary.lowStockCount}\n` +
-      `🔢 Total Balance Qty: ${summary.totalBalance}\n\n`;
-
-    const lowItems = data.filter(r => getBalanceFromRow(r) <= toNumber(r[4]));
-    if (lowItems.length > 0) {
-      msgOut += `🚨 Low Stock List:\n`;
-      for (const r of lowItems) {
-        msgOut += `💊 ${r[0]}: ${getBalanceFromRow(r)} ${clean(r[5] || '')} (Min: ${toNumber(r[4])})\n`;
+      for (const r of logs) {
+        rows.push([
+          clean(r[0] || ''),
+          clean(r[1] || ''),
+          clean(r[2] || ''),
+          toNumber(r[3]),
+          toNumber(r[4]),
+          toNumber(r[5]),
+          clean(r[6] || ''),
+          clean(r[7] || ''),
+          clean(r[8] || ''),
+          clean(r[9] || ''),
+          clean(r[10] || ''),
+          clean(r[11] || '')
+        ]);
       }
-    } else {
-      msgOut += `✅ No low stock items`;
+
+      const csv = rows.map(row => row.map(escapeCsv).join(',')).join('\n');
+      await appendReport('EXPORT_LOGS', `By=${actor}, Exported ${logs.length} logs`);
+
+      return sendDocument(chatId, `stock-logs-${getLocalDateString(APP_TIMEZONE)}.csv`, csv);
     }
 
-    await appendReport(
-      'REPORT_VIEW',
-      `By=${actor}, TotalItems=${summary.totalItems}, LowStock=${summary.lowStockCount}, TotalBalance=${summary.totalBalance}`
-    );
-
-    return sendLongMessage(chatId, msgOut);
-  }
-
-  if (command === '/exportsummary') {
-    const data = await getData();
-    if (data.length === 0) return sendMessage(chatId, '📭 No stock data to export');
-
-    const rows = [['Item', 'In', 'Out', 'Balance', 'MinAlert', 'Unit', 'UpdatedAt']];
-    for (const r of data) {
-      rows.push([
-        clean(r[0] || ''),
-        toNumber(r[1]),
-        toNumber(r[2]),
-        getBalanceFromRow(r),
-        toNumber(r[4]),
-        clean(r[5] || ''),
-        clean(r[6] || '')
-      ]);
-    }
-
-    const csv = rows.map(row => row.map(escapeCsv).join(',')).join('\n');
-    await appendReport('EXPORT_SUMMARY', `By=${actor}, Exported ${data.length} items`);
-
-    return sendDocument(chatId, `stock-summary-${getLocalDateString(APP_TIMEZONE)}.csv`, csv);
-  }
-
-  if (command === '/exportlogs') {
-    const logs = await getLogs();
-    if (logs.length === 0) return sendMessage(chatId, '📭 No logs to export');
-
-    const rows = [[
-      'Timestamp', 'Type', 'Item', 'Qty', 'BalanceBefore', 'BalanceAfter',
-      'Unit', 'ChatId', 'ChatTitle', 'Username', 'Role', 'Note'
-    ]];
-
-    for (const r of logs) {
-      rows.push([
-        clean(r[0] || ''),
-        clean(r[1] || ''),
-        clean(r[2] || ''),
-        toNumber(r[3]),
-        toNumber(r[4]),
-        toNumber(r[5]),
-        clean(r[6] || ''),
-        clean(r[7] || ''),
-        clean(r[8] || ''),
-        clean(r[9] || ''),
-        clean(r[10] || ''),
-        clean(r[11] || '')
-      ]);
-    }
-
-    const csv = rows.map(row => row.map(escapeCsv).join(',')).join('\n');
-    await appendReport('EXPORT_LOGS', `By=${actor}, Exported ${logs.length} logs`);
-
-    return sendDocument(chatId, `stock-logs-${getLocalDateString(APP_TIMEZONE)}.csv`, csv);
-  }
-
-  return sendMessage(chatId, '❌ Unknown command. Use /help');
+    return sendMessage(chatId, '❌ Unknown command. Use /help');
   } finally {
     if (processedMessageKey && !processedMessageMarked) {
       releaseProcessedMessage(processedMessageKey);
@@ -2017,14 +2825,36 @@ app.get('/webhook', (req, res) => {
   res.status(200).send('✅ Webhook endpoint is working');
 });
 
+/**************** BACKGROUND JOBS ****************/
+function startBackgroundJobs() {
+  setInterval(() => {
+    runNonCriticalTask('pruneProcessedMessageCache error:', async () => {
+      pruneProcessedMessageCache();
+      pruneRateLimitCache();
+    });
+  }, Math.max(60 * 1000, RATE_LIMIT_WINDOW_MS));
+
+  setInterval(() => {
+    runNonCriticalTask('autoCleanupSheets error:', autoCleanupSheets);
+  }, CLEANUP_INTERVAL_MS);
+
+  setInterval(() => {
+    runNonCriticalTask('sendDailyLowStockSummariesIfDue error:', sendDailyLowStockSummariesIfDue);
+  }, DAILY_REPORT_CHECK_INTERVAL_MS);
+}
+
 /**************** START SERVER ****************/
 async function start() {
   await setupSheet();
+  await autoCleanupSheets();
   console.log('✅ setupSheet done');
+
+  startBackgroundJobs();
 
   app.listen(PORT, () => {
     console.log('🚀 Server running on port ' + PORT);
     console.log('🌍 Timezone: ' + APP_TIMEZONE);
+    console.log('📣 Daily summary time: ' + DAILY_REPORT_HOUR + ':' + String(DAILY_REPORT_MINUTE).padStart(2, '0'));
   });
 }
 
