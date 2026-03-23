@@ -168,6 +168,9 @@ function cleanUsername(text) {
 function normalizeCommand(raw) {
   return norm(raw).split('@')[0];
 }
+function normalizeItemName(text) {
+  return norm(text);
+}
 function logError(label, err) {
   console.error(label, err?.response?.data || err?.message || err);
 }
