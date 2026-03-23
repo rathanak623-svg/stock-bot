@@ -159,6 +159,9 @@ function compact(text) {
 function norm(text) {
   return compact(text).toLowerCase();
 }
+function normalizeItemName(text) {
+  return norm(text);
+}
 function cleanUsername(text) {
   return clean(text).replace(/^@+/, '').toLowerCase();
 }
