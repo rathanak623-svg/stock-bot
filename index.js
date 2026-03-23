@@ -1360,7 +1360,7 @@ async function upsertGroupSetting(chatId, chatTitle, partial) {
 
 async function markDailyReportSent(chatId, chatTitle, dateString) {
   await upsertGroupSetting(chatId, chatTitle, {
-    lastDailyReportDate: dateString
+    lastDailyReportDate: clean(dateString)
   });
 }
 
@@ -2085,7 +2085,7 @@ async function sendDailyLowStockSummariesIfDue() {
 
   const today = getLocalDateString(APP_TIMEZONE);
   const [allowedChats, data] = await Promise.all([getAllowedChats(), getData()]);
-  const msg = buildLowStockSummaryMessage(data);
+  const lowStockMsg = buildLowStockSummaryMessage(data);
 
   for (const chat of allowedChats) {
     const chatId = String(chat[0] || '');
@@ -2096,9 +2096,9 @@ async function sendDailyLowStockSummariesIfDue() {
       const setting = await getGroupSetting(chatId);
 
       if (!setting.dailyReportEnabled) return;
-      if (setting.lastDailyReportDate === today) return;
+      if (clean(setting.lastDailyReportDate) === today) return;
 
-      await sendLongMessage(chatId, msg);
+      await sendLongMessage(chatId, lowStockMsg);
       await markDailyReportSent(chatId, chatTitle, today);
     });
   }
@@ -2473,7 +2473,7 @@ async function handleCommand(msg) {
           `🧩 ${clean(r[2] || '-')}\n` +
           `📣 DailyReport: ${setting.dailyReportEnabled}\n` +
           `🚨 Alerts: ${setting.lowStockAlertsEnabled}\n` +
-          `🗓 LastDailyReport: ${setting.lastDailyReportDate || '-'}\n\n`;
+          `🗓 LastDailyReportDate: ${setting.lastDailyReportDate || '-'}\n\n`;
       }
       return sendLongMessage(chatId, msgOut.trim());
     }
@@ -2528,7 +2528,10 @@ async function handleCommand(msg) {
       await markProcessedIfNeeded();
       await appendReport('SET_DAILY_REPORT', `By=${actor}, ChatId=${chatId}, Enabled=${value}`);
 
-      return sendMessage(chatId, `✅ Daily report is now ${value ? 'ON' : 'OFF'}`);
+      return sendMessage(
+        chatId,
+        `✅ Daily report at ${String(DAILY_REPORT_HOUR).padStart(2, '0')}:${String(DAILY_REPORT_MINUTE).padStart(2, '0')} (${APP_TIMEZONE}) is now ${value ? 'ON' : 'OFF'}`
+      );
     }
 
     if (command === '/setalerts') {
@@ -2542,7 +2545,7 @@ async function handleCommand(msg) {
       await markProcessedIfNeeded();
       await appendReport('SET_ALERTS', `By=${actor}, ChatId=${chatId}, Enabled=${value}`);
 
-      return sendMessage(chatId, `✅ Low-stock alerts are now ${value ? 'ON' : 'OFF'}`);
+      return sendMessage(chatId, `✅ Instant low-stock alerts are now ${value ? 'ON' : 'OFF'}`);
     }
 
     if (command === '/addsuperadmin' || command === '/addadmin' || command === '/addmember') {
