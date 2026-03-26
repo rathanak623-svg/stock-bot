@@ -191,6 +191,9 @@ function toNumber(value, fallback = 0) {
 function nowIso() {
   return new Date().toISOString();
 }
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 function minutesFromNowIso(minutes) {
   return new Date(Date.now() + minutes * 60 * 1000).toISOString();
 }
@@ -290,28 +293,12 @@ function parseOnOff(value) {
   return null;
 }
 function getDailyReplyKeyboard(role) {
-  const common = [
-    [{ text: '/dashboard' }, { text: '/allstock' }],
-    [{ text: '/lowstock' }, { text: '/restocklist' }],
-    [{ text: '/stock | ' }, { text: '/allstock | low' }],
-    [{ text: '/in | ' }, { text: '/out | ' }]
-  ];
-  if (role === 'super_admin' || role === 'admin') {
-    common.push(
-      [{ text: '/inbulk' }, { text: '/outbulk' }],
-      [{ text: '/additem | ' }, { text: '/undo | ' }],
-      [{ text: '/today' }, { text: '/exportsummary' }]
-    );
-  } else if (role === 'member') {
-    common.push(
-      [{ text: '/inbulk' }, { text: '/outbulk' }],
-      [{ text: '/today' }, { text: '/menu' }]
-    );
-  } else {
-    common.push([{ text: '/help' }]);
-  }
   return {
-    keyboard: common,
+    keyboard: [
+      [{ text: '/allstock' }],
+      [{ text: '/lowstock' }],
+      [{ text: '/restocklist' }]
+    ],
     resize_keyboard: true,
     persistent: true,
     input_field_placeholder: 'ជ្រើស command ឬវាយ command...'
@@ -327,30 +314,22 @@ function buildPendingActionInlineKeyboard(code) {
 }
 function buildQuickActionsInlineKeyboard(role = 'guest') {
   const rows = [];
+
   if (role === 'super_admin' || role === 'admin') {
     rows.push(
       [{ text: '➕ ADD ITEM', callback_data: 'QA|ADDITEM' }, { text: '📥 IN', callback_data: 'QA|IN' }],
       [{ text: '📤 OUT', callback_data: 'QA|OUT' }, { text: '📊 STOCK', callback_data: 'QA|STOCK' }],
-      [{ text: '📥➕ IN BULK', callback_data: 'QA|INBULK' }, { text: '📤➖ OUT BULK', callback_data: 'QA|OUTBULK' }],
       [{ text: '🚨 LOW STOCK', callback_data: 'QA|LOWSTOCK' }, { text: '🗂 ALL STOCK', callback_data: 'QA|ALLSTOCK' }],
-      [{ text: '🛒 RESTOCK', callback_data: 'QA|RESTOCKLIST' }, { text: '📈 DASHBOARD', callback_data: 'QA|DASHBOARD' }],
-      [{ text: '📋 MENU', callback_data: 'QA|MENU' }]
-    );
-  } else if (role === 'member') {
-    rows.push(
-      [{ text: '📥 IN', callback_data: 'QA|IN' }, { text: '📤 OUT', callback_data: 'QA|OUT' }],
-      [{ text: '📊 STOCK', callback_data: 'QA|STOCK' }, { text: '📥➕ IN BULK', callback_data: 'QA|INBULK' }],
-      [{ text: '📤➖ OUT BULK', callback_data: 'QA|OUTBULK' }, { text: '🚨 LOW STOCK', callback_data: 'QA|LOWSTOCK' }],
-      [{ text: '🗂 ALL STOCK', callback_data: 'QA|ALLSTOCK' }, { text: '🛒 RESTOCK', callback_data: 'QA|RESTOCKLIST' }],
-      [{ text: '📈 DASHBOARD', callback_data: 'QA|DASHBOARD' }, { text: '📋 MENU', callback_data: 'QA|MENU' }]
+      [{ text: '🛒 RESTOCK', callback_data: 'QA|RESTOCKLIST' }]
     );
   } else {
     rows.push(
+      [{ text: '📥 IN', callback_data: 'QA|IN' }, { text: '📤 OUT', callback_data: 'QA|OUT' }],
       [{ text: '📊 STOCK', callback_data: 'QA|STOCK' }, { text: '🚨 LOW STOCK', callback_data: 'QA|LOWSTOCK' }],
-      [{ text: '🗂 ALL STOCK', callback_data: 'QA|ALLSTOCK' }, { text: '🛒 RESTOCK', callback_data: 'QA|RESTOCKLIST' }],
-      [{ text: '📋 MENU', callback_data: 'QA|MENU' }]
+      [{ text: '🗂 ALL STOCK', callback_data: 'QA|ALLSTOCK' }, { text: '🛒 RESTOCK', callback_data: 'QA|RESTOCKLIST' }]
     );
   }
+
   return { inline_keyboard: rows };
 }
 function buildCallbackMsgLike(callbackQuery) {
@@ -2292,8 +2271,8 @@ async function handleCommand(msg) {
       const newBalance = Number(parts[2]);
       if (!isValidItemName(itemName)) return sendMessage(chatId, '⚠️ Invalid item name');
       if (Number.isNaN(newBalance) || newBalance < 0) return sendMessage(chatId, '⚠️ NewBalance must be a valid number >= 0');
-      return withStockSheetWriteLock(async () => withLock(`stock:${itemName}`, async () => {
-        const deptCtx = await getDepartmentContextFromMessage(msg);
+      const deptCtx = await getDepartmentContextFromMessage(msg);
+      return withStockSheetWriteLock(async () => withLock(`stock:${deptCtx.stockSheet}:${itemName}`, async () => {
       const ref = await getStockRowByItemName(itemName, deptCtx.stockSheet);
         if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
         const r = ref.row;
@@ -2303,7 +2282,13 @@ async function handleCommand(msg) {
         if (newBalance > currentIn) {
           return sendMessage(chatId, `⚠️ NewBalance cannot be greater than total In (${currentIn}).\nCurrent design keeps In unchanged and recalculates Out.`);
         }
-        const pending = await createPendingAction(username, actorCtx.userId, chatId, 'adjust', { itemName, newBalance });
+        const pending = await createPendingAction(username, actorCtx.userId, chatId, 'adjust', {
+          itemName,
+          newBalance,
+          stockSheet: deptCtx.stockSheet,
+          logsSheet: deptCtx.logsSheet,
+          department: deptCtx.department
+        });
         return sendMessage(
           chatId,
           `⚠️ Confirm Adjust Required\n\n` +
@@ -2447,16 +2432,19 @@ async function handleCommand(msg) {
       const newName = clean(parts[2]);
       if (!isValidItemName(oldName) || !isValidItemName(newName)) return sendMessage(chatId, '⚠️ Invalid old name or new name');
       if (norm(oldName) === norm(newName)) return sendMessage(chatId, '⚠️ Old name and new name are the same');
-      const lockKeys = [`stock:${oldName}`, `stock:${newName}`].sort();
+      const deptCtx = await getDepartmentContextFromMessage(msg);
+      const lockKeys = [
+        `stock:${deptCtx.stockSheet}:${oldName}`,
+        `stock:${deptCtx.stockSheet}:${newName}`
+      ].sort();
       return withStockSheetWriteLock(async () => withLock(lockKeys[0], async () => withLock(lockKeys[1], async () => {
-        const deptCtx = await getDepartmentContextFromMessage(msg);
         const data = await getData(deptCtx.stockSheet);
         const oldRow = findRowIndex(data, oldName);
         if (oldRow === -1) return sendMessage(chatId, `❌ Item not found: ${oldName}`);
         const existingNew = findRowIndex(data, newName);
         if (existingNew !== -1) return sendMessage(chatId, `⚠️ Item already exists: ${newName}`);
         const r = data[oldRow];
-        await updateRow(oldRow, [newName, toNumber(r[1]), toNumber(r[2]), getBalanceFromRow(r), toNumber(r[4]), clean(r[5] || ''), nowIso()]);
+        await updateRow(deptCtx.stockSheet, oldRow, [newName, toNumber(r[1]), toNumber(r[2]), getBalanceFromRow(r), toNumber(r[4]), clean(r[5] || ''), nowIso()]);
         await runNonCriticalTask('Append report error:', () =>
           appendReport('RENAME_ITEM', `By=${actor}, ${oldName} -> ${newName}`)
         );
