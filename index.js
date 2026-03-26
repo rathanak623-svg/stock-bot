@@ -297,7 +297,8 @@ function getDailyReplyKeyboard(role) {
     keyboard: [
       [{ text: '/allstock' }],
       [{ text: '/lowstock' }],
-      [{ text: '/restocklist' }]
+      [{ text: '/restocklist' }],
+      [{ text: '/Menu' }]
     ],
     resize_keyboard: true,
     persistent: true,
@@ -458,7 +459,7 @@ async function sendLongMessage(chatId, text, options = {}) {
   }
 }
 async function sendQuickActionsMenu(chatId, role = 'guest') {
-  await sendMessage(chatId, '⚡ Quick Actions', { replyMarkup: buildQuickActionsInlineKeyboard(role) });
+  await sendMessage(chatId, '⚡ Quick Actions', { replyMarkup: replyKeyboard });
 }
 function findRowIndex(data, itemName) {
   const target = norm(itemName);
@@ -1983,7 +1984,6 @@ async function handleCommand(msg) {
 
     if (command === '/menu') {
       clearInputSession(msg);
-      await sendMessage(chatId, '📌 Daily menu is ready', { replyMarkup: replyKeyboard });
       await sendQuickActionsMenu(chatId, role);
       return;
     }
@@ -2340,28 +2340,28 @@ async function handleCommand(msg) {
       const deptCtx = await getDepartmentContextFromMessage(msg);
       const ref = await getStockRowByItemName(itemName, deptCtx.stockSheet);
       if (!ref) return sendMessage(chatId, `❌ Item not found: ${itemName}`);
-      await sendMessage(chatId, `📊 Stock Info\n\n${buildStockMessage(ref.row)}`, { replyMarkup: buildQuickActionsInlineKeyboard(role) });
+      await sendMessage(chatId, `📊 Stock Info\n\n${buildStockMessage(ref.row)}`, { replyMarkup: replyKeyboard });
       return;
     }
 
     if (command === '/allstock') {
       const deptCtx = await getDepartmentContextFromMessage(msg);
       const data = await getData(deptCtx.stockSheet);
-      if (data.length === 0) return sendMessage(chatId, '📭 No stock data', { replyMarkup: buildQuickActionsInlineKeyboard(role) });
+      if (data.length === 0) return sendMessage(chatId, '📭 No stock data', { replyMarkup: replyKeyboard });
       const mode = clean(parts[1] || '');
       const rows = buildDepartmentStockRows(data);
       const msgOut = buildAllStockMessage(rows, deptCtx.department, mode);
-      await sendLongMessage(chatId, msgOut, { replyMarkup: buildQuickActionsInlineKeyboard(role) });
+      await sendLongMessage(chatId, msgOut, { replyMarkup: replyKeyboard });
       return;
     }
 
     if (command === '/restocklist') {
       const deptCtx = await getDepartmentContextFromMessage(msg);
       const data = await getData(deptCtx.stockSheet);
-      if (data.length === 0) return sendMessage(chatId, '📭 No stock data', { replyMarkup: buildQuickActionsInlineKeyboard(role) });
+      if (data.length === 0) return sendMessage(chatId, '📭 No stock data', { replyMarkup: replyKeyboard });
       const rows = buildDepartmentStockRows(data);
       const msgOut = buildRestockListMessage(rows, deptCtx.department);
-      await sendLongMessage(chatId, msgOut, { replyMarkup: buildQuickActionsInlineKeyboard(role) });
+      await sendLongMessage(chatId, msgOut, { replyMarkup: replyKeyboard });
       return;
     }
 
@@ -2369,9 +2369,9 @@ async function handleCommand(msg) {
 
       const deptCtx = await getDepartmentContextFromMessage(msg);
       const data = await getData(deptCtx.stockSheet);
-      if (data.length === 0) return sendMessage(chatId, '📭 No stock data', { replyMarkup: buildQuickActionsInlineKeyboard(role) });
+      if (data.length === 0) return sendMessage(chatId, '📭 No stock data', { replyMarkup: replyKeyboard });
       const lowItems = data.filter(r => getBalanceFromRow(r) <= toNumber(r[4]));
-      if (lowItems.length === 0) return sendMessage(chatId, '✅ No low stock items', { replyMarkup: buildQuickActionsInlineKeyboard(role) });
+      if (lowItems.length === 0) return sendMessage(chatId, '✅ No low stock items', { replyMarkup: replyKeyboard });
       let msgOut = '🚨 Low Stock Items\n\n';
       for (const r of lowItems) {
         const item = clean(r[0] || '');
@@ -2380,7 +2380,7 @@ async function handleCommand(msg) {
         const unit = clean(r[5] || '');
         msgOut += `💊 ${item}: ${balance} ${unit} (Min: ${minAlert})\n`;
       }
-      await sendLongMessage(chatId, msgOut, { replyMarkup: buildQuickActionsInlineKeyboard(role) });
+      await sendLongMessage(chatId, msgOut, { replyMarkup: replyKeyboard });
       return;
     }
 
@@ -2535,7 +2535,7 @@ async function handleCommand(msg) {
       const summary = summarizeTodayLogs(logs, APP_TIMEZONE);
       const totalTx = summary.inCount + summary.outCount + summary.adjustCount + summary.undoCount;
       if (totalTx === 0) {
-        return sendMessage(chatId, `📭 No transactions today (${summary.today}, ${APP_TIMEZONE})`, { replyMarkup: buildQuickActionsInlineKeyboard(role) });
+        return sendMessage(chatId, `📭 No transactions today (${summary.today}, ${APP_TIMEZONE})`, { replyMarkup: replyKeyboard });
       }
       const msgOut =
         `📅 Today Summary (${summary.today}, ${APP_TIMEZONE})\n\n` +
@@ -2543,7 +2543,7 @@ async function handleCommand(msg) {
         `📤 OUT Transactions: ${summary.outCount}\n➖ Total OUT Qty: ${summary.outQty}\n\n` +
         `🛠 Adjust Transactions: ${summary.adjustCount}\n↩️ Undo Transactions: ${summary.undoCount}\n\n` +
         `🧾 Total Transactions: ${totalTx}`;
-      await sendMessage(chatId, msgOut, { replyMarkup: buildQuickActionsInlineKeyboard(role) });
+      await sendMessage(chatId, msgOut, { replyMarkup: replyKeyboard });
       return;
     }
 
@@ -2593,7 +2593,7 @@ async function handleCommand(msg) {
       } else {
         msgOut += '✅ No low stock items';
       }
-      await sendLongMessage(chatId, msgOut, { replyMarkup: buildQuickActionsInlineKeyboard(role) });
+      await sendLongMessage(chatId, msgOut, { replyMarkup: replyKeyboard });
       return;
     }
 
