@@ -459,7 +459,7 @@ async function sendLongMessage(chatId, text, options = {}) {
   }
 }
 async function sendQuickActionsMenu(chatId, role = 'guest') {
-  await sendMessage(chatId, '⚡ Quick Actions', { replyMarkup: replyKeyboard });
+  await sendMessage(chatId, '⚡ Quick Actions', { replyMarkup: buildQuickActionsInlineKeyboard(role) });
 }
 function findRowIndex(data, itemName) {
   const target = norm(itemName);
