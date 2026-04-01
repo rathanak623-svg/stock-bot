@@ -1544,10 +1544,21 @@ function summarizeTodayLogs(logs, timeZone = APP_TIMEZONE) {
   }
   return { today, inCount, outCount, adjustCount, undoCount, inQty, outQty };
 }
-function buildLowStockSummaryMessage(data) {
+function buildDailyReportMessage(data, department = '') {
+  const normalizedDepartment = clean(department);
   const lowItems = data.filter(r => getBalanceFromRow(r) <= toNumber(r[4]));
-  if (lowItems.length === 0) return '✅ Daily Low Stock Summary\n\nNo low stock items today.';
-  let msg = '📣 Daily Low Stock Summary\n\n';
+  const titleSuffix = normalizedDepartment ? ` - ${normalizedDepartment}` : '';
+
+  let msg = `📊 Daily Report${titleSuffix}\n\n`;
+  msg += `📦 Total Items: ${data.length}\n`;
+  msg += `🚨 Low Stock Items: ${lowItems.length}\n\n`;
+
+  if (lowItems.length === 0) {
+    msg += '✅ No low stock items today.';
+    return msg;
+  }
+
+  msg += '🚨 Low Stock List\n';
   for (const r of lowItems.slice(0, 50)) {
     msg += `💊 ${clean(r[0] || '')}: ${getBalanceFromRow(r)} ${clean(r[5] || '')} (Min: ${toNumber(r[4])})\n`;
   }
@@ -1829,12 +1840,12 @@ async function sendDailyLowStockSummariesIfDue() {
     if (!chatId || !department) continue;
     const deptCfg = getDepartmentSheets(department);
     const data = await getData(deptCfg.stockSheet);
-    const lowStockMsg = buildLowStockSummaryMessage(data);
+    const dailyReportMsg = buildDailyReportMessage(data, deptCfg.label);
     await withLock(`daily-report:${chatId}:${today}`, async () => {
       const setting = await getGroupSetting(chatId);
       if (!setting.dailyReportEnabled) return;
       if (clean(setting.lastDailyReportDate) === today) return;
-      await sendLongMessage(chatId, lowStockMsg);
+      await sendLongMessage(chatId, dailyReportMsg);
       await markDailyReportSent(chatId, chatTitle, today);
     });
   }
